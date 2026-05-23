@@ -6,15 +6,25 @@ EPS Beat + 200일선 라지캡 스크리너
 """
 from __future__ import annotations
 
+import contextlib
+import io
+import logging
+import warnings
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import requests
-import io
 import re
 import time
 from datetime import datetime, date
-from typing import Optional
+from typing import Callable, Optional
+
+# yfinance: "No earnings dates found, symbol may be delisted" 등 stderr 노이즈 억제
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+YAHOO_BATCH_CHUNK = 30
+YAHOO_BATCH_PAUSE = 3.0
 
 # ──────────────────────────────────────────
 # 페이지 설정
@@ -56,7 +66,13 @@ with st.sidebar:
     max_fwd_pe = st.slider("Forward P/E 최대값", 10, 100, 40, 1,
                            disabled=not use_fpe_filter,
                            help="Forward P/E가 이 값보다 낮은 종목만 통과 (데이터 없는 종목은 통과 처리)")
-    request_delay = st.slider("종목당 API 딜레이 (초)", 0.1, 1.0, 0.3, 0.1)
+    request_delay = st.slider(
+        "종목당 API 딜레이 (초)", 0.5, 3.0, 1.2, 0.1,
+        help="Yahoo 차단 시 2초 이상 권장",
+    )
+    batch_chunk = st.slider("시세 배치 크기 (종목/요청)", 10, 50, 30, 5,
+                            help="한 번에 여러 종목 시세를 받아 API 호출 수를 줄입니다.")
+    use_batch_prices = st.checkbox("배치 시세 다운로드 (Yahoo 차단 완화)", value=True)
 
     st.markdown("---")
     st.markdown("### 📋 종목 범위")
@@ -437,9 +453,145 @@ def get_universe(source: str = "Russell 1000 (iShares IWB)") -> pd.DataFrame:
     return df
 
 
+@st.cache_resource
+def _yf_browser_session():
+    """curl_cffi 브라우저 위장 세션 (있으면 Yahoo 차단 완화)"""
+    try:
+        from curl_cffi.requests import Session
+        return Session(impersonate="chrome")
+    except Exception:
+        return None
+
+
+def _make_ticker(symbol: str):
+    session = _yf_browser_session()
+    return yf.Ticker(symbol, session=session) if session else yf.Ticker(symbol)
+
+
+def _yf_retry(fn: Callable, retries: int = 3, base_delay: float = 2.0):
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            return _quiet_call(fn)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("yfinance retry failed")
+
+
+def yahoo_health_check() -> tuple[bool, str]:
+    """스캔 전 Yahoo 접속 가능 여부 (SPY 5일봉)"""
+    try:
+        kwargs = dict(period="5d", interval="1d", progress=False, threads=False)
+        session = _yf_browser_session()
+        if session:
+            kwargs["session"] = session
+        data = _yf_retry(lambda: yf.download("SPY", **kwargs), retries=2, base_delay=2.0)
+        if data is None or (hasattr(data, "empty") and data.empty):
+            return False, "SPY 시세 없음 — IP 차단·레이트리밋 가능"
+        return True, "SPY 시세 수신 OK"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _batch_download_closes(
+    symbols: list[str],
+    chunk_size: int = YAHOO_BATCH_CHUNK,
+    pause: float = YAHOO_BATCH_PAUSE,
+) -> dict[str, pd.Series]:
+    """종목별 종가 시계열 — 개별 history() 대신 download() 배치"""
+    session = _yf_browser_session()
+    out: dict[str, pd.Series] = {}
+    kwargs = dict(
+        period="300d",
+        interval="1d",
+        group_by="ticker",
+        threads=False,
+        progress=False,
+        auto_adjust=True,
+    )
+    if session:
+        kwargs["session"] = session
+
+    for start in range(0, len(symbols), chunk_size):
+        chunk = symbols[start : start + chunk_size]
+        tickers = " ".join(chunk)
+        try:
+            data = _yf_retry(
+                lambda t=tickers: yf.download(t, **kwargs),
+                retries=3,
+                base_delay=pause,
+            )
+        except Exception:
+            time.sleep(pause * 2)
+            continue
+
+        if data is None or (hasattr(data, "empty") and data.empty):
+            time.sleep(pause)
+            continue
+
+        if len(chunk) == 1:
+            sym = chunk[0]
+            closes = data["Close"] if "Close" in data.columns else data.squeeze()
+            if isinstance(closes, pd.DataFrame):
+                closes = closes.iloc[:, 0]
+            out[sym] = closes.dropna()
+        elif isinstance(data.columns, pd.MultiIndex):
+            level0 = data.columns.get_level_values(0)
+            for sym in chunk:
+                if sym in level0:
+                    out[sym] = data[sym]["Close"].dropna()
+
+        time.sleep(pause)
+    return out
+
+
+def _ma200_from_closes(closes: pd.Series) -> Optional[dict]:
+    if closes is None or len(closes) < 201:
+        return None
+    ma200 = closes.rolling(200).mean().iloc[-1]
+    price = closes.iloc[-1]
+    if pd.isna(ma200) or ma200 <= 0 or pd.isna(price):
+        return None
+    ratio = price / ma200
+    return {
+        "price": round(float(price), 2),
+        "ma200": round(float(ma200), 2),
+        "ratio": round(float(ratio), 4),
+    }
+
+
+def build_ma200_cache(
+    symbols: list[str],
+    chunk_size: int,
+    use_batch: bool,
+) -> dict[str, dict]:
+    cache: dict[str, dict] = {}
+    if use_batch and symbols:
+        progress = st.progress(0, text="배치 시세 로딩 중...")
+        closes_map = {}
+        n_chunks = max(1, (len(symbols) + chunk_size - 1) // chunk_size)
+        for idx, start in enumerate(range(0, len(symbols), chunk_size)):
+            chunk = symbols[start : start + chunk_size]
+            progress.progress(
+                (idx + 1) / n_chunks,
+                text=f"시세 배치 {idx + 1}/{n_chunks} ({len(chunk)}종목)",
+            )
+            closes_map.update(_batch_download_closes(chunk, chunk_size=len(chunk)))
+        progress.empty()
+        for sym, closes in closes_map.items():
+            info = _ma200_from_closes(closes)
+            if info:
+                cache[sym] = info
+    return cache
+
+
 def _get_market_cap(ticker_obj) -> Optional[float]:
     try:
-        fi = ticker_obj.fast_info
+        fi = _quiet_call(lambda: ticker_obj.fast_info)
         for key in ("market_cap", "marketCap"):
             val = None
             try:
@@ -457,66 +609,134 @@ def _get_market_cap(ticker_obj) -> Optional[float]:
         return None
 
 
-def get_eps_beat_info(ticker_obj, n_quarters: int):
+def _quiet_call(fn: Callable):
+    """yfinance print/stderr 메시지 억제"""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            return fn()
+
+
+def _coerce_earnings_df(raw) -> Optional[pd.DataFrame]:
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        raw = pd.DataFrame(raw)
+    if not isinstance(raw, pd.DataFrame) or raw.empty:
+        return None
+
+    df = raw.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
+    rename: dict = {}
+    for col in df.columns:
+        key = str(col).strip().lower().replace(" ", "").replace("_", "")
+        if key in ("reportedeps", "epsactual", "actual"):
+            rename[col] = "Reported EPS"
+        elif key in ("epsestimate", "estimate"):
+            rename[col] = "EPS Estimate"
+    df = df.rename(columns=rename)
+
+    if "Reported EPS" not in df.columns or "EPS Estimate" not in df.columns:
+        return None
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        for date_col in ("Earnings Date", "Date", "Quarter", "period"):
+            if date_col in df.columns:
+                df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+                df = df.dropna(subset=[date_col]).set_index(date_col)
+                break
+        else:
+            try:
+                df.index = pd.to_datetime(df.index, errors="coerce")
+            except Exception:
+                return None
+
+    df["Reported EPS"] = pd.to_numeric(df["Reported EPS"], errors="coerce")
+    df["EPS Estimate"] = pd.to_numeric(df["EPS Estimate"], errors="coerce")
+    return df.sort_index(ascending=False)
+
+
+def _fetch_earnings_dataframe(ticker_obj, symbol: str) -> pd.DataFrame:
+    """
+    Yahoo/yfinance 실적 API는 종목별로 깨지는 경우가 많음 (HLT 등).
+    여러 소스를 순서대로 시도하고, 실패 시 빈 DataFrame 반환.
+    """
+    loaders: list[Callable] = [
+        lambda: ticker_obj.get_earnings_dates(limit=24),
+        lambda: ticker_obj.earnings_dates,
+        lambda: ticker_obj.get_earnings_history(),
+    ]
+
+    for loader in loaders:
+        try:
+            raw = _yf_retry(loader, retries=2, base_delay=1.5)
+            df = _coerce_earnings_df(raw)
+            if df is not None and not df.empty:
+                valid = df.dropna(subset=["Reported EPS", "EPS Estimate"])
+                if len(valid) >= 1:
+                    return df
+        except Exception:
+            continue
+
+    return pd.DataFrame()
+
+
+def _quarterly_earnings_rows(past: pd.DataFrame) -> pd.DataFrame:
+    """Yahoo 중복 행 제거 — 분기당 1행"""
+    past = past.sort_index(ascending=False).copy()
+    if isinstance(past.index, pd.DatetimeIndex):
+        past["_q"] = past.index.to_period("Q")
+        past = past.drop_duplicates(subset=["_q"], keep="first").drop(columns=["_q"])
+    return past
+
+
+def get_eps_beat_info(ticker_obj, symbol: str, n_quarters: int):
     """
     최근 n_quarters 분기 모두 EPS 비트했는지 확인
     Returns: (passed: bool, details: list of dicts)
     """
     try:
-        earnings = ticker_obj.get_earnings_dates(limit=20)
-        if earnings is None or earnings.empty:
+        earnings = _fetch_earnings_dataframe(ticker_obj, symbol)
+        if earnings.empty:
             return False, []
 
-        # 실제 발표된 분기만 필터 (Reported EPS 존재)
-        past = earnings.dropna(subset=['Reported EPS', 'EPS Estimate']).copy()
+        past = earnings.dropna(subset=["Reported EPS", "EPS Estimate"]).copy()
+        past = _quarterly_earnings_rows(past)
         if len(past) < n_quarters:
             return False, []
 
-        past = past.sort_index(ascending=False)
         recent = past.head(n_quarters)
         details = []
         for idx, row in recent.iterrows():
-            est  = row['EPS Estimate']
-            rep  = row['Reported EPS']
+            est = row["EPS Estimate"]
+            rep = row["Reported EPS"]
             beat = rep > est
             surp = ((rep - est) / abs(est) * 100) if est != 0 else 0.0
             details.append({
-                'date':     str(idx.date()) if hasattr(idx, 'date') else str(idx),
-                'estimate': round(float(est), 4),
-                'reported': round(float(rep), 4),
-                'surprise': round(float(surp), 2),
-                'beat':     bool(beat),
+                "date": str(idx.date()) if hasattr(idx, "date") else str(idx),
+                "estimate": round(float(est), 4),
+                "reported": round(float(rep), 4),
+                "surprise": round(float(surp), 2),
+                "beat": bool(beat),
             })
 
-        all_beat = all(d['beat'] for d in details)
-        return all_beat, details
+        return all(d["beat"] for d in details), details
 
     except Exception:
         return False, []
 
 
-def get_ma200_info(ticker_obj):
-    """
-    200일 이동평균선 대비 현재가 확인
-    Returns: (passed: bool, price, ma200, ratio) or None on failure
-    """
+def get_ma200_info(ticker_obj, ma_cache: Optional[dict] = None, symbol: str = ""):
+    """200일선 — ma_cache에 있으면 Yahoo 재호출 없음"""
+    if ma_cache and symbol and symbol in ma_cache:
+        return ma_cache[symbol]
     try:
-        hist = ticker_obj.history(period="300d", interval="1d")
+        hist = _yf_retry(lambda: ticker_obj.history(period="300d", interval="1d"), retries=2)
         if hist is None or len(hist) < 201:
             return None
-
-        closes = hist['Close']
-        ma200  = closes.rolling(200).mean().iloc[-1]
-        price  = closes.iloc[-1]
-        if pd.isna(ma200) or ma200 <= 0:
-            return None
-        ratio  = price / ma200
-
-        return {
-            'price':  round(float(price),  2),
-            'ma200':  round(float(ma200),  2),
-            'ratio':  round(float(ratio),  4),
-        }
+        return _ma200_from_closes(hist["Close"])
     except Exception:
         return None
 
@@ -529,7 +749,7 @@ def get_fper_info(ticker_obj, price: float):
     Returns dict or None
     """
     try:
-        info = ticker_obj.info
+        info = _quiet_call(lambda: ticker_obj.info)
         fwd_eps     = info.get('forwardEps')
         trail_eps   = info.get('trailingEps')
         fwd_pe      = info.get('forwardPE')      # 야후가 직접 제공할 때
@@ -562,32 +782,40 @@ def get_fper_info(ticker_obj, price: float):
         return {'fwd_pe': None, 'trail_pe': None, 'fwd_eps': None, 'trail_eps': None}
 
 
-def screen_ticker(row, n_quarters, min_mcap_b, min_price_vs_ma,
-                  use_fpe_filter=False, max_fwd_pe=40):
+def screen_ticker(
+    row,
+    n_quarters,
+    min_mcap_b,
+    min_price_vs_ma,
+    use_fpe_filter=False,
+    max_fwd_pe=40,
+    ma_cache: Optional[dict] = None,
+):
     """단일 종목 스크리닝, 통과하면 결과 dict 반환, 아니면 None"""
-    ticker_sym = row['Symbol']
+    ticker_sym = row["Symbol"]
     try:
-        t = yf.Ticker(ticker_sym)
+        t = _make_ticker(ticker_sym)
 
-        # 시가총액 체크
+        ma_info = get_ma200_info(t, ma_cache=ma_cache, symbol=ticker_sym)
+        if ma_info is None:
+            return None
+        if ma_info["ratio"] < min_price_vs_ma:
+            return None
+
+        # 시가총액·EPS는 종목별 호출 (배치 불가)
         mcap = _get_market_cap(t)
         if mcap is None or mcap < min_mcap_b * 1e9:
             return None
 
-        # EPS 비트 체크
-        eps_pass, eps_details = get_eps_beat_info(t, n_quarters)
+        eps_pass, eps_details = get_eps_beat_info(t, ticker_sym, n_quarters)
         if not eps_pass:
             return None
 
-        # 200일선 체크
-        ma_info = get_ma200_info(t)
-        if ma_info is None:
-            return None
-        if ma_info['ratio'] < min_price_vs_ma:
-            return None
-
-        # Forward P/E 계산
-        fper = get_fper_info(t, ma_info['price'])
+        fper = (
+            get_fper_info(t, ma_info["price"])
+            if use_fpe_filter
+            else {"fwd_pe": None, "trail_pe": None, "fwd_eps": None, "trail_eps": None}
+        )
 
         # Forward P/E 필터 (데이터 있는 경우만 적용)
         if use_fpe_filter and fper.get('fwd_pe') is not None:
@@ -611,6 +839,21 @@ def screen_ticker(row, n_quarters, min_mcap_b, min_price_vs_ma,
 
     except Exception:
         return None
+
+
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("### 🌐 Yahoo Finance")
+    if st.button("Yahoo 연결 테스트 (SPY)", use_container_width=True):
+        ok, msg = yahoo_health_check()
+        if ok:
+            st.success(f"연결 정상 — {msg}")
+        else:
+            st.error(f"연결 실패 — {msg}")
+    st.caption(
+        "Cloud·과도한 스캔 시 IP 차단됨. 차단 시 30~60분 대기, "
+        "딜레이 2초+, 로컬 실행 권장."
+    )
 
 
 # ──────────────────────────────────────────
@@ -653,9 +896,29 @@ if run_btn:
     if "테스트" in universe_src:
         sp500 = sp500.head(50)
 
+    ok, health_msg = yahoo_health_check()
+    if not ok:
+        st.error(
+            f"**Yahoo Finance에 연결되지 않습니다.**\n\n{health_msg}\n\n"
+            "· 30~60분 후 다시 시도\n"
+            "· 종목당 딜레이 2초 이상\n"
+            "· **테스트(50종목)** 으로 먼저 확인\n"
+            "· Streamlit Cloud는 IP 차단이 잦음 → **로컬 PC**에서 실행 권장"
+        )
+        st.stop()
+
+    symbols = sp500["Symbol"].tolist()
+    ma_cache = build_ma200_cache(symbols, batch_chunk, use_batch_prices)
+    if use_batch_prices and len(ma_cache) < max(5, len(symbols) * 0.05):
+        st.warning(
+            f"배치 시세가 거의 수신되지 않았습니다 ({len(ma_cache)}/{len(symbols)}). "
+            "Yahoo IP 차단 가능성이 큽니다. 잠시 후 다시 시도하세요."
+        )
+
     total   = len(sp500)
     results = []
     skipped = 0
+    no_ma_count = 0
 
     progress_bar = st.progress(0, text="초기화 중...")
     status_col1, status_col2, status_col3 = st.columns(3)
@@ -674,8 +937,13 @@ if run_btn:
         passed_metric.metric("조건 통과", len(results))
         skipped_metric.metric("데이터 없음/제외", skipped)
 
-        result = screen_ticker(row, n_quarters, min_mcap_b, min_price_vs_ma,
-                               use_fpe_filter, max_fwd_pe)
+        if use_batch_prices and sym not in ma_cache:
+            no_ma_count += 1
+
+        result = screen_ticker(
+            row, n_quarters, min_mcap_b, min_price_vs_ma,
+            use_fpe_filter, max_fwd_pe, ma_cache=ma_cache,
+        )
         time.sleep(request_delay)
 
         if result:
@@ -689,7 +957,19 @@ if run_btn:
             log_lines = log_lines[:8]
         log_placeholder.markdown("\n".join(log_lines))
 
+        # 초반에 전부 실패하면 Yahoo 차단으로 조기 중단
+        if i == 24 and len(results) == 0 and skipped >= 23:
+            st.error(
+                "연속 25종목 모두 실패했습니다. Yahoo Finance IP 차단·레이트리밋으로 보입니다. "
+                "스캔을 중단합니다. 30~60분 후 딜레이를 늘려 다시 시도하세요."
+            )
+            break
+
     progress_bar.progress(1.0, text="스크리닝 완료!")
+    if no_ma_count > total * 0.8:
+        st.warning(
+            f"시세 데이터 미수신 {no_ma_count}/{total}건 — Yahoo 차단 시 배치 로딩이 실패합니다."
+        )
     st.session_state['results']  = results
     st.session_state['run_date'] = datetime.now().strftime("%Y-%m-%d %H:%M")
 
