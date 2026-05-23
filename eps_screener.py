@@ -1,9 +1,10 @@
 """
 EPS Beat + 200일선 라지캡 스크리너
-- S&P 500 종목 대상
-- 최근 3분기 연속 EPS 비트
+- Russell 1000 / S&P 500 유니버스
+- 최근 N분기 연속 EPS 비트
 - 현재가 > 200일 이동평균선 (일봉 기준)
 """
+from __future__ import annotations
 
 import streamlit as st
 import yfinance as yf
@@ -12,9 +13,8 @@ import requests
 import io
 import re
 import time
-import json
 from datetime import datetime, date
-import traceback
+from typing import Optional
 
 # ──────────────────────────────────────────
 # 페이지 설정
@@ -74,7 +74,7 @@ ISHARES_IWB_PRODUCT = "https://www.ishares.com/us/products/239707/ishares-russel
 TRENDSPIDER_R1000_URL = "https://trendspider.com/learning-center/russell-1000-index/"
 
 
-def _browser_headers(referer: str | None = None, accept_csv: bool = False) -> dict:
+def _browser_headers(referer: Optional[str] = None, accept_csv: bool = False) -> dict:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -153,7 +153,7 @@ def _parse_ishares_holdings_csv(text: str) -> pd.DataFrame:
         df_raw = df_raw[keep].copy()
 
     df_raw["Symbol"] = df_raw["Symbol"].astype(str).str.strip()
-    df_raw = df_raw[~df_raw["Symbol"].str.upper().isin({"TICKER", "NAN", ""])]
+    df_raw = df_raw[~df_raw["Symbol"].str.upper().isin({"TICKER", "NAN", ""})]
     return _finalize_universe(df_raw)
 
 
@@ -341,53 +341,8 @@ def _load_wikipedia_sp500() -> pd.DataFrame:
     return _finalize_universe(df)
 
 
-@st.cache_data(ttl=86400)
-def get_universe(source: str = "Russell 1000 (iShares IWB)"):
-    """
-    종목 유니버스 로딩
-    Russell 1000:
-      1) iShares IWB (CSV/HTML)
-      2) TrendSpider 공개 구성종목 표
-      3) Wikipedia S&P 500 + S&P 400 (대략 900종, R1000 근사)
-    S&P 500: Wikipedia
-    실패 시: 내장 100종목
-    """
-    if "Russell" in source:
-        loaders = [
-            ("iShares IWB", _load_ishares_russell1000),
-            ("TrendSpider", _load_trendspider_russell1000),
-            ("S&P 500 + S&P 400 (Russell 1000 근사)", _load_sp500_plus_sp400),
-        ]
-        errors: list[str] = []
-        for label, loader in loaders:
-            try:
-                df = loader()
-                if len(df) > 100:
-                    if label != "iShares IWB":
-                        st.info(f"Russell 1000: **{label}**에서 {len(df)}개 종목 로딩")
-                    return df
-                errors.append(f"{label}: 종목 수 {len(df)}")
-            except Exception as exc:
-                errors.append(f"{label}: {exc}")
-
-        st.error(
-            "Russell 1000 목록을 불러오지 못했습니다. "
-            "잠시 후 다시 시도하거나, 사이드바에서 S&P 500을 선택해 보세요.\n\n"
-            + " · ".join(errors)
-        )
-        st.warning("최후 수단으로 S&P 500만 사용합니다.")
-        try:
-            return _load_wikipedia_sp500()
-        except Exception as exc:
-            st.warning(f"Wikipedia S&P 500 실패 ({exc}), 내장 종목 사용.")
-
-    if "S&P" in source:
-        try:
-            return _load_wikipedia_sp500()
-        except Exception as exc:
-            st.warning(f"Wikipedia S&P 500 실패, 내장 종목 사용. ({exc})")
-
-    # ── 내장 100종목 ───────────────────────────────────────────
+def _builtin_fallback_universe() -> pd.DataFrame:
+    """내장 100종목 (모든 원격 소스 실패 시)"""
     fallback = [
         ("AAPL","Apple Inc.","Information Technology"),("MSFT","Microsoft Corp.","Information Technology"),
         ("NVDA","NVIDIA Corp.","Information Technology"),("AMZN","Amazon.com Inc.","Consumer Discretionary"),
@@ -423,6 +378,85 @@ def get_universe(source: str = "Russell 1000 (iShares IWB)"):
     return pd.DataFrame(fallback, columns=["Symbol", "Company", "Sector"])
 
 
+@st.cache_data(ttl=86400)
+def _get_universe_cached(source: str) -> tuple[pd.DataFrame, str, str]:
+    """
+    Returns: (dataframe, source_label, ui_level)
+    ui_level: '' | 'info' | 'warning' | 'error'
+    """
+    if "Russell" in source:
+        loaders = [
+            ("iShares IWB", _load_ishares_russell1000),
+            ("TrendSpider", _load_trendspider_russell1000),
+            ("S&P 500 + S&P 400 (Russell 1000 근사)", _load_sp500_plus_sp400),
+        ]
+        errors: list[str] = []
+        for label, loader in loaders:
+            try:
+                df = loader()
+                if len(df) > 100:
+                    return df, label, ("info" if label != "iShares IWB" else "")
+                errors.append(f"{label}: 종목 수 {len(df)}")
+            except Exception as exc:
+                errors.append(f"{label}: {exc}")
+
+        try:
+            df = _load_wikipedia_sp500()
+            detail = " · ".join(errors) if errors else "원인 미상"
+            return (
+                df,
+                f"S&P 500 대체 (Russell 실패: {detail})",
+                "warning",
+            )
+        except Exception as exc:
+            errors.append(f"S&P 500: {exc}")
+            detail = " · ".join(errors)
+            return (
+                _builtin_fallback_universe(),
+                f"내장 100종목 ({detail})",
+                "error",
+            )
+
+    if "S&P" in source:
+        try:
+            return _load_wikipedia_sp500(), "Wikipedia S&P 500", ""
+        except Exception as exc:
+            return _builtin_fallback_universe(), f"내장 100종목 ({exc})", "warning"
+
+    return _builtin_fallback_universe(), "내장 100종목", "warning"
+
+
+def get_universe(source: str = "Russell 1000 (iShares IWB)") -> pd.DataFrame:
+    df, label, level = _get_universe_cached(source)
+    if level == "info":
+        st.info(f"Russell 1000: **{label}**에서 {len(df)}개 종목 로딩")
+    elif level == "warning":
+        st.warning(f"종목 목록: **{label}** ({len(df)}개)")
+    elif level == "error":
+        st.error(f"Russell 1000 로딩 실패 — **{label}** ({len(df)}개)만 사용합니다.")
+    return df
+
+
+def _get_market_cap(ticker_obj) -> Optional[float]:
+    try:
+        fi = ticker_obj.fast_info
+        for key in ("market_cap", "marketCap"):
+            val = None
+            try:
+                val = fi[key]  # FastInfo는 dict-like
+            except (TypeError, KeyError):
+                val = getattr(fi, key, None)
+            if val is not None and not pd.isna(val):
+                return float(val)
+    except Exception:
+        pass
+    try:
+        mcap = ticker_obj.info.get("marketCap")
+        return float(mcap) if mcap else None
+    except Exception:
+        return None
+
+
 def get_eps_beat_info(ticker_obj, n_quarters: int):
     """
     최근 n_quarters 분기 모두 EPS 비트했는지 확인
@@ -438,6 +472,7 @@ def get_eps_beat_info(ticker_obj, n_quarters: int):
         if len(past) < n_quarters:
             return False, []
 
+        past = past.sort_index(ascending=False)
         recent = past.head(n_quarters)
         details = []
         for idx, row in recent.iterrows():
@@ -473,6 +508,8 @@ def get_ma200_info(ticker_obj):
         closes = hist['Close']
         ma200  = closes.rolling(200).mean().iloc[-1]
         price  = closes.iloc[-1]
+        if pd.isna(ma200) or ma200 <= 0:
+            return None
         ratio  = price / ma200
 
         return {
@@ -533,8 +570,7 @@ def screen_ticker(row, n_quarters, min_mcap_b, min_price_vs_ma,
         t = yf.Ticker(ticker_sym)
 
         # 시가총액 체크
-        info   = t.fast_info
-        mcap   = getattr(info, 'market_cap', None)
+        mcap = _get_market_cap(t)
         if mcap is None or mcap < min_mcap_b * 1e9:
             return None
 
@@ -581,8 +617,13 @@ def screen_ticker(row, n_quarters, min_mcap_b, min_price_vs_ma,
 # 메인 UI
 # ──────────────────────────────────────────
 st.markdown('<div class="main-title">📈 EPS Beat + 200일선 스크리너</div>', unsafe_allow_html=True)
+_universe_label = (
+    "Russell 1000" if "Russell" in universe_src
+    else ("S&P 500" if "S&P" in universe_src else "테스트 유니버스")
+)
 st.markdown(
-    f'<div class="sub-title">S&P 500 라지캡 | 최근 {n_quarters}분기 연속 EPS 비트 | 현재가 > 200일 이동평균선</div>',
+    f'<div class="sub-title">{_universe_label} | 최근 {n_quarters}분기 연속 EPS 비트 | '
+    f'현재가/200일선 ≥ {min_price_vs_ma:.0%}</div>',
     unsafe_allow_html=True,
 )
 
@@ -595,6 +636,7 @@ with col_reset:
         st.session_state.pop('results', None)
         st.session_state.pop('run_date', None)
         get_universe.clear()
+        _get_universe_cached.clear()
         st.rerun()
 
 # ──────────────────────────────────────────
@@ -614,7 +656,6 @@ if run_btn:
 
     total   = len(sp500)
     results = []
-    errors  = []
     skipped = 0
 
     progress_bar = st.progress(0, text="초기화 중...")
