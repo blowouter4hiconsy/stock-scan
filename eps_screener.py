@@ -1,9 +1,17 @@
 """
-EPS Beat + 200일선 라지캡 스크리너
+EPS Beat + 200일선 라지캡 스크리너 (최적화 버전)
 - Russell 1000 / S&P 500 유니버스
 - 최근 N분기 연속 EPS 비트
 - 200일선 위(강세) 또는 아래(저평가) 선택 가능
-- ★ 야후 파이낸스 애널리스트 별점 추가 (recommendationMean / Key / # Analysts)
+- ★ 야후 파이낸스 애널리스트 별점 추가
+
+[최적화 내역]
+1. .info 병렬 프리패치: 티커당 3번 호출 → 전체에서 1번(병렬)
+2. 필터 순서 최적화: MA200(캐시) → 시총(프리패치) → EPS → PE/Rating
+3. Ticker 객체 생성 최소화: EPS 조회 시에만 생성
+4. Streamlit 프로그레스 업데이트 주기 제한 (매 N회)
+5. PE/Rating 데이터를 항상 수집 (프리패치 정보라 공짜)
+6. 사용자 설정 max_workers 추가
 """
 from __future__ import annotations
 
@@ -11,6 +19,7 @@ import contextlib
 import io
 import logging
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 import yfinance as yf
@@ -19,7 +28,7 @@ import requests
 import re
 import time
 from datetime import datetime, date
-from typing import Callable, Optional
+from typing import Optional
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
@@ -45,7 +54,6 @@ st.markdown("""
                   border-radius: 12px; padding: 2px 10px; font-size: 0.78rem; font-weight: 600; }
     .below-chip { display: inline-block; background: #fff3e0; color: #e65100;
                   border-radius: 12px; padding: 2px 10px; font-size: 0.78rem; font-weight: 600; }
-    /* ── 애널리스트 별점 뱃지 ── */
     .r-strong-buy  { display:inline-block; background:#1e7e34; color:#fff;
                      border-radius:8px; padding:1px 9px; font-size:.78rem; font-weight:600; }
     .r-buy         { display:inline-block; background:#28a745; color:#fff;
@@ -82,12 +90,12 @@ with st.sidebar:
     above_mode = ma_mode.startswith("📈")
 
     if above_mode:
-        ma_ratio_label = "현재가 / 200일선 최소 비율"
-        ma_ratio_help  = "1.05 → 200일선보다 5% 이상 위에 있어야 통과"
+        ma_ratio_label   = "현재가 / 200일선 최소 비율"
+        ma_ratio_help    = "1.05 → 200일선보다 5% 이상 위에 있어야 통과"
         ma_ratio_default = 1.00
     else:
-        ma_ratio_label = "현재가 / 200일선 최대 비율"
-        ma_ratio_help  = "0.95 → 200일선보다 5% 이상 아래에 있어야 통과"
+        ma_ratio_label   = "현재가 / 200일선 최대 비율"
+        ma_ratio_help    = "0.95 → 200일선보다 5% 이상 아래에 있어야 통과"
         ma_ratio_default = 1.00
 
     ma_ratio_threshold = st.slider(
@@ -105,12 +113,10 @@ with st.sidebar:
         help="Forward P/E가 이 값보다 낮은 종목만 통과 (데이터 없는 종목은 통과 처리)",
     )
 
-    # ── 애널리스트 별점 필터 (신규) ─────────────────────────────
     st.markdown("---")
     st.markdown("### ⭐ 애널리스트 별점 필터")
     use_rating_filter = st.checkbox("별점 하한 적용", value=False,
                                     help="야후 파이낸스 recommendationMean 기준 (1=Strong Buy, 5=Strong Sell)")
-    # 표시 편의를 위해 슬라이더를 '별 개수'로 표현 (5개=1.xx, 1개=4.xx)
     MIN_STARS_LABEL = {5: "⭐⭐⭐⭐⭐ Strong Buy (≤1.5)", 4: "⭐⭐⭐⭐ Buy (≤2.5)",
                        3: "⭐⭐⭐ Hold (≤3.5)", 2: "⭐⭐ Underperform (≤4.5)"}
     min_star_sel = st.select_slider(
@@ -121,12 +127,9 @@ with st.sidebar:
         disabled=not use_rating_filter,
         help="선택한 등급 이상(숫자 기준 이하)인 종목만 통과",
     )
-    # 별 개수 → recommendationMean 상한 변환
     STAR_TO_MEAN_MAX = {5: 1.5, 4: 2.5, 3: 3.5, 2: 4.5}
     max_rating_mean = STAR_TO_MEAN_MAX[min_star_sel]
-    # ────────────────────────────────────────────────────────────
 
-    # 저평가 모드 전용 추가 필터
     if not above_mode:
         st.markdown("---")
         st.markdown("### 🔍 저평가 추가 필터")
@@ -140,9 +143,16 @@ with st.sidebar:
         use_max_drawdown = False
         min_drawdown_pct = 0
 
-    request_delay = st.slider("종목당 API 딜레이 (초)", 0.5, 3.0, 1.2, 0.1)
-    batch_chunk   = st.slider("시세 배치 크기", 10, 50, 30, 5)
+    st.markdown("---")
+    st.markdown("### ⚡ 성능 설정")
+    request_delay    = st.slider("EPS 조회 딜레이 (초)", 0.3, 3.0, 0.8, 0.1,
+                                  help="EPS 조회(earnings_dates)당 딜레이. 이전 버전은 모든 API 호출에 적용됐으나 이제 EPS 전용입니다.")
+    batch_chunk      = st.slider("시세 배치 크기", 10, 50, 30, 5)
     use_batch_prices = st.checkbox("배치 시세 다운로드", value=True)
+    max_workers      = st.slider("병렬 워커 수 (info 프리패치)", 2, 16, 6, 1,
+                                  help="숫자가 클수록 빠르지만 Yahoo IP 차단 위험 증가. 권장: 4~8")
+    progress_interval = st.slider("진행률 업데이트 주기 (종목 수)", 1, 20, 5, 1,
+                                   help="매 N개 종목마다 화면 갱신. 클수록 UI 렉이 줄어듦.")
 
     st.markdown("---")
     st.markdown("### 📋 종목 범위")
@@ -151,7 +161,7 @@ with st.sidebar:
         "S&P 500 (Wikipedia) — 500종목",
         "테스트 (상위 50종목)",
     ])
-    st.caption("Russell 1000 전체 스캔 시 20~30분 소요됩니다.")
+    st.caption("Russell 1000 전체 스캔 시 약 8~15분 소요됩니다. (최적화 후)")
 
 # ──────────────────────────────────────────
 # 유니버스 로딩
@@ -239,13 +249,14 @@ def _load_sp500_plus_sp400():
     h = _browser_headers()
     r500 = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", headers=h, timeout=20)
     r500.raise_for_status()
-    sp500 = pd.read_html(io.StringIO(r500.text))[0][["Symbol","Security","GICS Sector"]].rename(columns={"Security":"Company","GICS Sector":"Sector"})
+    sp500 = pd.read_html(io.StringIO(r500.text))[0][["Symbol","Security","GICS Sector"]].rename(
+        columns={"Security":"Company","GICS Sector":"Sector"})
     r400 = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", headers=h, timeout=20)
     r400.raise_for_status()
     sp400 = pd.read_html(io.StringIO(r400.text))[0]
-    sym_col    = next((c for c in sp400.columns if str(c).strip().lower() in ("symbol","ticker symbol")), None)
-    company_col= next((c for c in sp400.columns if str(c).strip().lower() in ("security","company")), sym_col)
-    sector_col = next((c for c in sp400.columns if "gics sector" in str(c).strip().lower()), None)
+    sym_col     = next((c for c in sp400.columns if str(c).strip().lower() in ("symbol","ticker symbol")), None)
+    company_col = next((c for c in sp400.columns if str(c).strip().lower() in ("security","company")), sym_col)
+    sector_col  = next((c for c in sp400.columns if "gics sector" in str(c).strip().lower()), None)
     if sym_col is None: raise ValueError("S&P 400 Symbol 컬럼 없음")
     sp400 = sp400[[sym_col, company_col] + ([sector_col] if sector_col else [])].rename(
         columns={sym_col:"Symbol", company_col:"Company", **({sector_col:"Sector"} if sector_col else {})}
@@ -254,9 +265,11 @@ def _load_sp500_plus_sp400():
     return _finalize_universe(pd.concat([sp500, sp400], ignore_index=True))
 
 def _load_wikipedia_sp500():
-    r = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", headers=_browser_headers(), timeout=20)
+    r = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+                     headers=_browser_headers(), timeout=20)
     r.raise_for_status()
-    df = pd.read_html(io.StringIO(r.text))[0][["Symbol","Security","GICS Sector"]].rename(columns={"Security":"Company","GICS Sector":"Sector"})
+    df = pd.read_html(io.StringIO(r.text))[0][["Symbol","Security","GICS Sector"]].rename(
+        columns={"Security":"Company","GICS Sector":"Sector"})
     return _finalize_universe(df)
 
 def _builtin_fallback_universe():
@@ -298,8 +311,8 @@ def _builtin_fallback_universe():
 def _get_universe_cached(source):
     if "Russell" in source:
         loaders = [
-            ("iShares IWB",           _load_ishares_russell1000),
-            ("S&P 500 + S&P 400",     _load_sp500_plus_sp400),
+            ("iShares IWB",       _load_ishares_russell1000),
+            ("S&P 500 + S&P 400", _load_sp500_plus_sp400),
         ]
         errors = []
         for label, loader in loaders:
@@ -374,13 +387,132 @@ def yahoo_health_check():
     except Exception as exc:
         return False, str(exc)
 
+# ──────────────────────────────────────────
+# ★ 핵심 최적화 ①: 병렬 .info 프리패치
+# ──────────────────────────────────────────
+def _fetch_single_info(sym: str) -> tuple[str, dict]:
+    """단일 티커의 .info를 조용히 수집. (ThreadPoolExecutor에서 호출)"""
+    try:
+        info = _quiet_call(lambda: yf.Ticker(sym).info) or {}
+        return sym, info
+    except Exception:
+        return sym, {}
+
+def prefetch_info_bulk(symbols: list[str], max_workers: int = 6) -> dict[str, dict]:
+    """
+    모든 심볼의 .info를 병렬로 프리패치.
+    배치 단위로 처리해 Yahoo 레이트리밋을 완화.
+    """
+    BATCH_SIZE = max_workers * 5   # 한 배치에 처리할 심볼 수
+    INTER_BATCH_PAUSE = 1.5        # 배치 간 대기 (초)
+
+    cache: dict[str, dict] = {}
+    n_batches = max(1, (len(symbols) + BATCH_SIZE - 1) // BATCH_SIZE)
+    progress  = st.progress(0, text="종목 기본정보 병렬 수집 중...")
+
+    for b_idx, start in enumerate(range(0, len(symbols), BATCH_SIZE)):
+        chunk = symbols[start : start + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(_fetch_single_info, sym): sym for sym in chunk}
+            for fut in as_completed(futures):
+                sym, info = fut.result()
+                cache[sym] = info
+
+        progress.progress(
+            (b_idx + 1) / n_batches,
+            text=f"기본정보 수집 {b_idx + 1}/{n_batches} 배치 "
+                 f"({min(start + BATCH_SIZE, len(symbols))}/{len(symbols)} 종목)",
+        )
+        if b_idx < n_batches - 1:
+            time.sleep(INTER_BATCH_PAUSE)
+
+    progress.empty()
+    return cache
+
+# ──────────────────────────────────────────
+# ★ 핵심 최적화 ②: info 딕셔너리에서 직접 파싱
+#    → HTTP 추가 호출 없음
+# ──────────────────────────────────────────
+def _parse_mcap_from_info(info: dict) -> Optional[float]:
+    """info 딕셔너리에서 시가총액 추출."""
+    for key in ("marketCap", "market_cap"):
+        val = info.get(key)
+        if val is not None:
+            try:
+                v = float(val)
+                if v > 0: return v
+            except (TypeError, ValueError):
+                pass
+    return None
+
+def _parse_fper_from_info(info: dict, price: float) -> dict:
+    """info 딕셔너리에서 PE / EPS 파싱. HTTP 호출 없음."""
+    try:
+        fwd_eps   = info.get("forwardEps")
+        trail_eps = info.get("trailingEps")
+        fwd_pe    = info.get("forwardPE")
+        trail_pe  = info.get("trailingPE")
+        result: dict = {}
+
+        if fwd_pe   and float(fwd_pe)   > 0: result["fwd_pe"]   = round(float(fwd_pe),   1)
+        elif fwd_eps and float(fwd_eps) > 0: result["fwd_pe"]   = round(price / float(fwd_eps), 1)
+        else:                                 result["fwd_pe"]   = None
+
+        if trail_pe   and float(trail_pe)   > 0: result["trail_pe"] = round(float(trail_pe),   1)
+        elif trail_eps and float(trail_eps) > 0: result["trail_pe"] = round(price / float(trail_eps), 1)
+        else:                                     result["trail_pe"] = None
+
+        result["fwd_eps"]   = round(float(fwd_eps),   2) if fwd_eps   else None
+        result["trail_eps"] = round(float(trail_eps), 2) if trail_eps else None
+        return result
+    except Exception:
+        return {"fwd_pe": None, "trail_pe": None, "fwd_eps": None, "trail_eps": None}
+
+_KEY_LABEL = {
+    "strong_buy":   "Strong Buy",
+    "buy":          "Buy",
+    "hold":         "Hold",
+    "underperform": "Underperform",
+    "sell":         "Sell",
+}
+_KEY_CSS = {
+    "Strong Buy":   "r-strong-buy",
+    "Buy":          "r-buy",
+    "Hold":         "r-hold",
+    "Underperform": "r-underperform",
+    "Sell":         "r-sell",
+}
+
+def _parse_analyst_from_info(info: dict) -> dict:
+    """info 딕셔너리에서 애널리스트 별점 파싱. HTTP 호출 없음."""
+    try:
+        mean    = info.get("recommendationMean")
+        key_raw = info.get("recommendationKey", "")
+        n_anal  = info.get("numberOfAnalystOpinions")
+
+        key_label = _KEY_LABEL.get(str(key_raw).lower(), key_raw or "N/A")
+        stars = max(1, min(5, round(6 - float(mean)))) if mean is not None else None
+
+        return {
+            "rating_mean":  round(float(mean), 2) if mean is not None else None,
+            "rating_key":   key_label,
+            "rating_stars": stars,
+            "n_analysts":   int(n_anal) if n_anal is not None else None,
+        }
+    except Exception:
+        return {"rating_mean": None, "rating_key": "N/A", "rating_stars": None, "n_analysts": None}
+
+# ──────────────────────────────────────────
+# 배치 시세 다운로드 (MA200)
+# ──────────────────────────────────────────
 def _batch_download_closes(symbols, chunk_size=YAHOO_BATCH_CHUNK, pause=YAHOO_BATCH_PAUSE):
     session = _yf_browser_session()
     out = {}
-    kwargs = dict(period="300d", interval="1d", group_by="ticker", threads=False, progress=False, auto_adjust=True)
+    kwargs = dict(period="300d", interval="1d", group_by="ticker",
+                  threads=False, progress=False, auto_adjust=True)
     if session: kwargs["session"] = session
     for start in range(0, len(symbols), chunk_size):
-        chunk   = symbols[start:start+chunk_size]
+        chunk   = symbols[start : start + chunk_size]
         tickers = " ".join(chunk)
         try:
             data = _yf_retry(lambda t=tickers: yf.download(t, **kwargs), retries=3, base_delay=pause)
@@ -402,8 +534,8 @@ def _batch_download_closes(symbols, chunk_size=YAHOO_BATCH_CHUNK, pause=YAHOO_BA
 
 def _ma200_from_closes(closes):
     if closes is None or len(closes) < 201: return None
-    ma200 = closes.rolling(200).mean().iloc[-1]
-    price = closes.iloc[-1]
+    ma200  = closes.rolling(200).mean().iloc[-1]
+    price  = closes.iloc[-1]
     high52 = closes.rolling(252).max().iloc[-1]
     if pd.isna(ma200) or ma200 <= 0 or pd.isna(price): return None
     return {
@@ -411,17 +543,21 @@ def _ma200_from_closes(closes):
         "ma200":    round(float(ma200), 2),
         "ratio":    round(float(price / ma200), 4),
         "high52":   round(float(high52), 2) if not pd.isna(high52) else None,
-        "drawdown": round((price - high52) / high52 * 100, 1) if not pd.isna(high52) and high52 > 0 else None,
+        "drawdown": round((price - high52) / high52 * 100, 1)
+                    if not pd.isna(high52) and high52 > 0 else None,
     }
 
 def build_ma200_cache(symbols, chunk_size, use_batch):
     cache = {}
     if use_batch and symbols:
-        progress  = st.progress(0, text="배치 시세 로딩 중...")
+        progress = st.progress(0, text="배치 시세 로딩 중...")
         n_chunks  = max(1, (len(symbols) + chunk_size - 1) // chunk_size)
         for idx, start in enumerate(range(0, len(symbols), chunk_size)):
-            chunk = symbols[start:start+chunk_size]
-            progress.progress((idx+1)/n_chunks, text=f"시세 배치 {idx+1}/{n_chunks} ({len(chunk)}종목)")
+            chunk = symbols[start : start + chunk_size]
+            progress.progress(
+                (idx + 1) / n_chunks,
+                text=f"시세 배치 {idx + 1}/{n_chunks} ({len(chunk)}종목)",
+            )
             closes_map = _batch_download_closes(chunk, chunk_size=len(chunk))
             for sym, closes in closes_map.items():
                 info = _ma200_from_closes(closes)
@@ -429,19 +565,9 @@ def build_ma200_cache(symbols, chunk_size, use_batch):
         progress.empty()
     return cache
 
-def _get_market_cap(ticker_obj):
-    try:
-        fi = _quiet_call(lambda: ticker_obj.fast_info)
-        for key in ("market_cap", "marketCap"):
-            try: val = fi[key]
-            except (TypeError, KeyError): val = getattr(fi, key, None)
-            if val is not None and not pd.isna(val): return float(val)
-    except Exception: pass
-    try:
-        mcap = ticker_obj.info.get("marketCap")
-        return float(mcap) if mcap else None
-    except Exception: return None
-
+# ──────────────────────────────────────────
+# EPS 조회 (여전히 티커당 1회 HTTP 필요)
+# ──────────────────────────────────────────
 def _coerce_earnings_df(raw):
     if raw is None: return None
     if isinstance(raw, dict): raw = pd.DataFrame(raw)
@@ -451,13 +577,13 @@ def _coerce_earnings_df(raw):
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
     rename = {}
     for col in df.columns:
-        key = str(col).strip().lower().replace(" ","").replace("_","")
-        if key in ("reportedeps","epsactual","actual"): rename[col] = "Reported EPS"
-        elif key in ("epsestimate","estimate"):          rename[col] = "EPS Estimate"
+        key = str(col).strip().lower().replace(" ", "").replace("_", "")
+        if key in ("reportedeps", "epsactual", "actual"): rename[col] = "Reported EPS"
+        elif key in ("epsestimate", "estimate"):           rename[col] = "EPS Estimate"
     df = df.rename(columns=rename)
     if "Reported EPS" not in df.columns or "EPS Estimate" not in df.columns: return None
     if not isinstance(df.index, pd.DatetimeIndex):
-        for date_col in ("Earnings Date","Date","Quarter","period"):
+        for date_col in ("Earnings Date", "Date", "Quarter", "period"):
             if date_col in df.columns:
                 df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
                 df = df.dropna(subset=[date_col]).set_index(date_col)
@@ -469,7 +595,7 @@ def _coerce_earnings_df(raw):
     df["EPS Estimate"] = pd.to_numeric(df["EPS Estimate"], errors="coerce")
     return df.sort_index(ascending=False)
 
-def _fetch_earnings_dataframe(ticker_obj, symbol):
+def _fetch_earnings_dataframe(ticker_obj):
     loaders = [
         lambda: ticker_obj.get_earnings_dates(limit=24),
         lambda: ticker_obj.earnings_dates,
@@ -480,7 +606,7 @@ def _fetch_earnings_dataframe(ticker_obj, symbol):
             raw = _yf_retry(loader, retries=2, base_delay=1.5)
             df  = _coerce_earnings_df(raw)
             if df is not None and not df.empty:
-                valid = df.dropna(subset=["Reported EPS","EPS Estimate"])
+                valid = df.dropna(subset=["Reported EPS", "EPS Estimate"])
                 if len(valid) >= 1: return df
         except Exception: continue
     return pd.DataFrame()
@@ -492,11 +618,11 @@ def _quarterly_earnings_rows(past):
         past = past.drop_duplicates(subset=["_q"], keep="first").drop(columns=["_q"])
     return past
 
-def get_eps_beat_info(ticker_obj, symbol, n_quarters):
+def get_eps_beat_info(ticker_obj, n_quarters):
     try:
-        earnings = _fetch_earnings_dataframe(ticker_obj, symbol)
+        earnings = _fetch_earnings_dataframe(ticker_obj)
         if earnings.empty: return False, []
-        past = earnings.dropna(subset=["Reported EPS","EPS Estimate"]).copy()
+        past = earnings.dropna(subset=["Reported EPS", "EPS Estimate"]).copy()
         past = _quarterly_earnings_rows(past)
         if len(past) < n_quarters: return False, []
         recent  = past.head(n_quarters)
@@ -507,100 +633,19 @@ def get_eps_beat_info(ticker_obj, symbol, n_quarters):
             beat = rep > est
             surp = ((rep - est) / abs(est) * 100) if est != 0 else 0.0
             details.append({
-                "date":     str(idx.date()) if hasattr(idx,"date") else str(idx),
+                "date":     str(idx.date()) if hasattr(idx, "date") else str(idx),
                 "estimate": round(float(est), 4),
                 "reported": round(float(rep), 4),
                 "surprise": round(float(surp), 2),
                 "beat":     bool(beat),
             })
         return all(d["beat"] for d in details), details
-    except Exception: return False, []
-
-def get_ma200_info(ticker_obj, ma_cache=None, symbol=""):
-    if ma_cache and symbol and symbol in ma_cache: return ma_cache[symbol]
-    try:
-        hist = _yf_retry(lambda: ticker_obj.history(period="300d", interval="1d"), retries=2)
-        if hist is None or len(hist) < 201: return None
-        return _ma200_from_closes(hist["Close"])
-    except Exception: return None
-
-# ══════════════════════════════════════════
-# ★ 신규: 애널리스트 별점 조회 함수
-# ══════════════════════════════════════════
-# Yahoo Finance info 필드:
-#   recommendationMean  : float 1(Strong Buy) ~ 5(Strong Sell)
-#   recommendationKey   : "strong_buy" | "buy" | "hold" | "underperform" | "sell"
-#   numberOfAnalystOpinions : int
-_KEY_LABEL = {
-    "strong_buy":   "Strong Buy",
-    "buy":          "Buy",
-    "hold":         "Hold",
-    "underperform": "Underperform",
-    "sell":         "Sell",
-}
-_KEY_CSS = {
-    "Strong Buy":   "r-strong-buy",
-    "Buy":          "r-buy",
-    "Hold":         "r-hold",
-    "Underperform": "r-underperform",
-    "Sell":         "r-sell",
-}
-
-def get_analyst_rating(ticker_obj):
-    """
-    야후 파이낸스 애널리스트 컨센서스 반환.
-    반환값:
-        rating_mean  : float 1~5  (1=Strong Buy, 5=Strong Sell) | None
-        rating_key   : str  e.g. "Buy", "Hold"                  | "N/A"
-        rating_stars : int  1~5  (별 개수, mean 반올림 역산)      | None
-        n_analysts   : int  분석가 수                             | None
-    """
-    try:
-        info    = _quiet_call(lambda: ticker_obj.info)
-        mean    = info.get("recommendationMean")
-        key_raw = info.get("recommendationKey", "")
-        n_anal  = info.get("numberOfAnalystOpinions")
-
-        key_label = _KEY_LABEL.get(str(key_raw).lower(), key_raw or "N/A")
-
-        # 별 개수: mean 1→5개별, 5→1개별  (반올림 후 클램프)
-        if mean is not None:
-            stars = max(1, min(5, round(6 - float(mean))))
-        else:
-            stars = None
-
-        return {
-            "rating_mean":  round(float(mean), 2) if mean is not None else None,
-            "rating_key":   key_label,
-            "rating_stars": stars,
-            "n_analysts":   int(n_anal) if n_anal is not None else None,
-        }
     except Exception:
-        return {"rating_mean": None, "rating_key": "N/A", "rating_stars": None, "n_analysts": None}
-
-
-def get_fper_info(ticker_obj, price):
-    try:
-        info     = _quiet_call(lambda: ticker_obj.info)
-        fwd_eps  = info.get("forwardEps")
-        trail_eps= info.get("trailingEps")
-        fwd_pe   = info.get("forwardPE")
-        trail_pe = info.get("trailingPE")
-        result   = {}
-        if fwd_pe   and fwd_pe   > 0: result["fwd_pe"]   = round(float(fwd_pe),   1)
-        elif fwd_eps and fwd_eps > 0: result["fwd_pe"]   = round(price/float(fwd_eps), 1)
-        else:                          result["fwd_pe"]   = None
-        if trail_pe   and trail_pe   > 0: result["trail_pe"] = round(float(trail_pe),   1)
-        elif trail_eps and trail_eps > 0: result["trail_pe"] = round(price/float(trail_eps), 1)
-        else:                              result["trail_pe"] = None
-        result["fwd_eps"]   = round(float(fwd_eps),   2) if fwd_eps   else None
-        result["trail_eps"] = round(float(trail_eps), 2) if trail_eps else None
-        return result
-    except Exception:
-        return {"fwd_pe":None,"trail_pe":None,"fwd_eps":None,"trail_eps":None}
+        return False, []
 
 # ──────────────────────────────────────────
-# 핵심 스크리닝 함수
+# ★ 핵심 최적화 ③: screen_ticker 재설계
+#    HTTP 호출: 기존 4회 → 1회 (EPS만)
 # ──────────────────────────────────────────
 def screen_ticker(
     row, n_quarters, min_mcap_b,
@@ -608,13 +653,21 @@ def screen_ticker(
     use_fpe_filter=False, max_fwd_pe=40,
     use_max_drawdown=False, min_drawdown_pct=20,
     use_rating_filter=False, max_rating_mean=2.5,
-    ma_cache=None,
+    ma_cache: Optional[dict] = None,
+    info_cache: Optional[dict] = None,
 ):
-    ticker_sym = row["Symbol"]
+    sym = row["Symbol"]
     try:
-        t = _make_ticker(ticker_sym)
-
-        ma_info = get_ma200_info(t, ma_cache=ma_cache, symbol=ticker_sym)
+        # ── Step 1: MA200 (배치 캐시에서 즉시, HTTP 없음) ──────────
+        ma_info = ma_cache.get(sym) if ma_cache else None
+        if ma_info is None:
+            # 캐시 미스 시 개별 다운로드 (폴백)
+            t = _make_ticker(sym)
+            try:
+                hist = _yf_retry(lambda: t.history(period="300d", interval="1d"), retries=2)
+                ma_info = _ma200_from_closes(hist["Close"]) if hist is not None and len(hist) >= 201 else None
+            except Exception:
+                ma_info = None
         if ma_info is None: return None
 
         ratio = ma_info["ratio"]
@@ -627,47 +680,50 @@ def screen_ticker(
                 if drawdown is None or drawdown > -min_drawdown_pct:
                     return None
 
-        mcap = _get_market_cap(t)
+        # ── Step 2: 시총 (프리패치 info에서, HTTP 없음) ────────────
+        info = (info_cache or {}).get(sym, {})
+        mcap = _parse_mcap_from_info(info)
         if mcap is None or mcap < min_mcap_b * 1e9: return None
 
-        eps_pass, eps_details = get_eps_beat_info(t, ticker_sym, n_quarters)
-        if not eps_pass: return None
+        price = ma_info["price"]
 
-        fper = get_fper_info(t, ma_info["price"]) if use_fpe_filter else \
-               {"fwd_pe":None,"trail_pe":None,"fwd_eps":None,"trail_eps":None}
+        # ── Step 3: PE / 별점 (프리패치 info에서, HTTP 없음) ───────
+        fper    = _parse_fper_from_info(info, price)
+        analyst = _parse_analyst_from_info(info)
+
         if use_fpe_filter and fper.get("fwd_pe") is not None:
             if fper["fwd_pe"] > max_fwd_pe: return None
 
-        # ── 애널리스트 별점 수집 & 필터 ──────────────────────────
-        analyst = get_analyst_rating(t)
         if use_rating_filter and analyst["rating_mean"] is not None:
-            if analyst["rating_mean"] > max_rating_mean:
-                return None
-        # ─────────────────────────────────────────────────────────
+            if analyst["rating_mean"] > max_rating_mean: return None
+
+        # ── Step 4: EPS (유일한 HTTP 호출 — 필터 통과 후에만) ──────
+        t = _make_ticker(sym)
+        eps_pass, eps_details = get_eps_beat_info(t, n_quarters)
+        if not eps_pass: return None
 
         return {
-            "Symbol":        ticker_sym,
-            "Company":       row["Company"],
-            "Sector":        row["Sector"],
-            "Price":         ma_info["price"],
-            "MA200":         ma_info["ma200"],
-            "Price/MA200":   ratio,
-            "High52":        ma_info.get("high52"),
-            "Drawdown%":     ma_info.get("drawdown"),
-            "MCap($B)":      round(mcap/1e9, 1),
-            "Fwd PE":        fper.get("fwd_pe"),
-            "Trail PE":      fper.get("trail_pe"),
-            "Fwd EPS":       fper.get("fwd_eps"),
-            "Trail EPS":     fper.get("trail_eps"),
-            # ── 별점 ──────────────────────────────────────────────
-            "Rating Mean":   analyst["rating_mean"],
-            "Rating Key":    analyst["rating_key"],
-            "Rating Stars":  analyst["rating_stars"],
-            "# Analysts":    analyst["n_analysts"],
-            # ──────────────────────────────────────────────────────
-            "EPS Details":   eps_details,
+            "Symbol":       sym,
+            "Company":      row["Company"],
+            "Sector":       row["Sector"],
+            "Price":        price,
+            "MA200":        ma_info["ma200"],
+            "Price/MA200":  ratio,
+            "High52":       ma_info.get("high52"),
+            "Drawdown%":    ma_info.get("drawdown"),
+            "MCap($B)":     round(mcap / 1e9, 1),
+            "Fwd PE":       fper.get("fwd_pe"),
+            "Trail PE":     fper.get("trail_pe"),
+            "Fwd EPS":      fper.get("fwd_eps"),
+            "Trail EPS":    fper.get("trail_eps"),
+            "Rating Mean":  analyst["rating_mean"],
+            "Rating Key":   analyst["rating_key"],
+            "Rating Stars": analyst["rating_stars"],
+            "# Analysts":   analyst["n_analysts"],
+            "EPS Details":  eps_details,
         }
-    except Exception: return None
+    except Exception:
+        return None
 
 # ──────────────────────────────────────────
 # 사이드바 — Yahoo 헬스체크
@@ -701,7 +757,7 @@ with col_run:
     run_btn = st.button("🚀 스크리닝 시작", type="primary", use_container_width=True)
 with col_reset:
     if st.button("🗑️ 초기화", use_container_width=True):
-        for k in ("results","run_date","run_mode"):
+        for k in ("results", "run_date", "run_mode"):
             st.session_state.pop(k, None)
         _get_universe_cached.clear()
         st.rerun()
@@ -714,30 +770,59 @@ if run_btn:
                else ("S&P 500 (Wikipedia)" if "S&P" in universe_src
                else "Russell 1000 (iShares IWB)"))
     universe_df = get_universe(src_key)
-    if "테스트" in universe_src: universe_df = universe_df.head(50)
+    if "테스트" in universe_src:
+        universe_df = universe_df.head(50)
 
     ok, health_msg = yahoo_health_check()
     if not ok:
-        st.error(f"**Yahoo Finance 연결 불가**\n\n{health_msg}\n\n· 30~60분 후 재시도 · 딜레이 2초+ · 로컬 실행 권장")
+        st.error(
+            f"**Yahoo Finance 연결 불가**\n\n{health_msg}\n\n"
+            "· 30~60분 후 재시도 · 딜레이 2초+ · 로컬 실행 권장"
+        )
         st.stop()
 
-    symbols  = universe_df["Symbol"].tolist()
+    symbols = universe_df["Symbol"].tolist()
+
+    # ── Phase 1: 배치 시세 (MA200) ────────────────────────────────
     ma_cache = build_ma200_cache(symbols, batch_chunk, use_batch_prices)
     if use_batch_prices and len(ma_cache) < max(5, len(symbols) * 0.05):
-        st.warning(f"배치 시세 미수신 ({len(ma_cache)}/{len(symbols)}). Yahoo IP 차단 가능성. 잠시 후 재시도.")
+        st.warning(
+            f"배치 시세 미수신 ({len(ma_cache)}/{len(symbols)}). "
+            "Yahoo IP 차단 가능성. 잠시 후 재시도."
+        )
 
+    # ── Phase 2: ★ 병렬 .info 프리패치 ──────────────────────────
+    #    기존 코드: 티커당 .info 3회 → 1000종목 × 3 = 3,000 HTTP
+    #    최적화 후: 전체 1회(병렬) → 1,000 HTTP, 소요시간 대폭 단축
+    st.info(f"**Phase 2/3** — {len(symbols)}개 종목 기본정보 병렬 수집 중 (워커: {max_workers}개)…")
+    info_cache = prefetch_info_bulk(symbols, max_workers=max_workers)
+    n_info_ok  = sum(1 for v in info_cache.values() if v)
+    st.success(f"기본정보 수집 완료: {n_info_ok}/{len(symbols)}개 성공")
+
+    # ── Phase 3: EPS 조회 + 필터링 (순차, 1종목 1회 HTTP) ────────
+    st.info("**Phase 3/3** — EPS 조회 및 필터링 중…")
     total, results, skipped = len(universe_df), [], 0
     progress_bar = st.progress(0, text="초기화 중...")
     sc1, sc2, sc3 = st.columns(3)
-    m_scanned = sc1.empty(); m_passed = sc2.empty(); m_skipped = sc3.empty()
+    m_scanned = sc1.empty()
+    m_passed  = sc2.empty()
+    m_skipped = sc3.empty()
     log_ph, log_lines = st.empty(), []
+
+    consecutive_fails = 0  # IP 차단 감지용
 
     for i, (_, row) in enumerate(universe_df.iterrows()):
         sym = row["Symbol"]
-        progress_bar.progress((i+1)/total, text=f"스캔 중... {sym} ({i+1}/{total})")
-        m_scanned.metric("스캔 완료", f"{i+1}/{total}")
-        m_passed.metric("조건 통과", len(results))
-        m_skipped.metric("제외", skipped)
+
+        # ★ 최적화: 진행률 업데이트 주기 제한 (매 N회)
+        if i % progress_interval == 0 or i == total - 1:
+            progress_bar.progress(
+                (i + 1) / total,
+                text=f"EPS 스캔 중... {sym} ({i + 1}/{total})",
+            )
+            m_scanned.metric("스캔 완료", f"{i + 1}/{total}")
+            m_passed.metric("조건 통과", len(results))
+            m_skipped.metric("제외", skipped)
 
         result = screen_ticker(
             row, n_quarters, min_mcap_b,
@@ -746,31 +831,41 @@ if run_btn:
             use_max_drawdown, min_drawdown_pct,
             use_rating_filter, max_rating_mean,
             ma_cache=ma_cache,
+            info_cache=info_cache,
         )
-        time.sleep(request_delay)
+        time.sleep(request_delay)  # EPS 조회 딜레이 (HTTP 1회만 남음)
 
         if result:
+            consecutive_fails = 0
             results.append(result)
             log_lines.insert(0, f"✅ {sym} — 통과")
         else:
+            consecutive_fails += 1
             skipped += 1
             log_lines.insert(0, f"⬜ {sym}")
-        if len(log_lines) > 8: log_lines = log_lines[:8]
+
+        if len(log_lines) > 8:
+            log_lines = log_lines[:8]
         log_ph.markdown("\n".join(log_lines))
 
-        if i == 24 and len(results) == 0 and skipped >= 23:
+        # IP 차단 감지: 연속 25개 실패 (단, info_cache가 있는 경우 기준 완화)
+        if consecutive_fails >= 25 and len(results) == 0:
             st.error("연속 25종목 모두 실패 — Yahoo IP 차단으로 보입니다. 스캔 중단.")
             break
 
     progress_bar.progress(1.0, text="스크리닝 완료!")
-    st.session_state.update(results=results, run_date=datetime.now().strftime("%Y-%m-%d %H:%M"), run_mode=mode_label)
+    st.session_state.update(
+        results=results,
+        run_date=datetime.now().strftime("%Y-%m-%d %H:%M"),
+        run_mode=mode_label,
+    )
 
 # ──────────────────────────────────────────
 # 결과 표시
 # ──────────────────────────────────────────
 if "results" in st.session_state:
     results  = st.session_state["results"]
-    run_date = st.session_state.get("run_date","")
+    run_date = st.session_state.get("run_date", "")
     run_mode = st.session_state.get("run_mode", mode_label)
     is_below = "저평가" in run_mode
 
@@ -789,9 +884,11 @@ if "results" in st.session_state:
         filtered = [r for r in results if r["Sector"] in sel_sectors]
 
         sort_options = (
-            ["Drawdown% (하락 큰 순)", "Rating (좋은 순)", "Price/MA200 (오름차순)", "Fwd PE (오름차순)", "MCap($B) (내림차순)", "Symbol (가나다)"]
+            ["Drawdown% (하락 큰 순)", "Rating (좋은 순)", "Price/MA200 (오름차순)",
+             "Fwd PE (오름차순)", "MCap($B) (내림차순)", "Symbol (가나다)"]
             if is_below else
-            ["Price/MA200 (내림차순)", "Rating (좋은 순)", "MCap($B) (내림차순)", "Fwd PE (오름차순)", "Symbol (가나다)"]
+            ["Price/MA200 (내림차순)", "Rating (좋은 순)", "MCap($B) (내림차순)",
+             "Fwd PE (오름차순)", "Symbol (가나다)"]
         )
         sort_by = st.selectbox("정렬 기준", sort_options)
 
@@ -810,12 +907,11 @@ if "results" in st.session_state:
         else:
             filtered = sorted(filtered, key=lambda x: x["Symbol"])
 
-        # ── 요약 테이블 ──────────────────────────────────────────
+        # ── 요약 테이블 ────────────────────────────────────────────
         summary_rows = []
         for r in filtered:
-            # 별점 텍스트 표현
             if r.get("Rating Stars") is not None:
-                stars_str = "⭐" * r["Rating Stars"]
+                stars_str  = "⭐" * r["Rating Stars"]
                 rating_str = f"{stars_str}  {r['Rating Mean']:.2f}"
             else:
                 rating_str = "N/A"
@@ -831,15 +927,13 @@ if "results" in st.session_state:
             if is_below:
                 row_d["52W High"] = f"${r['High52']:,.2f}" if r.get("High52") else "N/A"
                 row_d["Drawdown"] = f"{r['Drawdown%']:.1f}%" if r.get("Drawdown%") is not None else "N/A"
-            # ── 별점 컬럼 ───────────────────────────────────────
-            row_d["Rating"]      = rating_str
-            row_d["Rating Key"]  = r.get("Rating Key") or "N/A"
-            row_d["# Analysts"]  = r.get("# Analysts") if r.get("# Analysts") is not None else "N/A"
-            # ────────────────────────────────────────────────────
-            row_d["Fwd PE"]   = f"{r['Fwd PE']:.1f}x"   if r.get("Fwd PE")   else "N/A"
-            row_d["Trail PE"] = f"{r['Trail PE']:.1f}x"  if r.get("Trail PE") else "N/A"
-            row_d["Fwd EPS"]  = f"${r['Fwd EPS']:.2f}"  if r.get("Fwd EPS")  else "N/A"
-            row_d["MCap($B)"] = f"${r['MCap($B)']:,.1f}B"
+            row_d["Rating"]     = rating_str
+            row_d["Rating Key"] = r.get("Rating Key") or "N/A"
+            row_d["# Analysts"] = r.get("# Analysts") if r.get("# Analysts") is not None else "N/A"
+            row_d["Fwd PE"]     = f"{r['Fwd PE']:.1f}x"  if r.get("Fwd PE")   else "N/A"
+            row_d["Trail PE"]   = f"{r['Trail PE']:.1f}x" if r.get("Trail PE") else "N/A"
+            row_d["Fwd EPS"]    = f"${r['Fwd EPS']:.2f}"  if r.get("Fwd EPS")  else "N/A"
+            row_d["MCap($B)"]   = f"${r['MCap($B)']:,.1f}B"
             for qi, q in enumerate(r["EPS Details"], 1):
                 sign = "+" if q["surprise"] >= 0 else ""
                 row_d[f"Q-{qi} 서프라이즈"] = f"{sign}{q['surprise']:.1f}%"
@@ -847,7 +941,7 @@ if "results" in st.session_state:
 
         st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-        # ── 종목 카드 ────────────────────────────────────────────
+        # ── 종목 카드 ──────────────────────────────────────────────
         st.markdown("#### 📋 종목별 상세")
         for i in range(0, len(filtered), 3):
             cols = st.columns(3)
@@ -857,7 +951,10 @@ if "results" in st.session_state:
                 r = filtered[idx]
                 with col:
                     with st.container(border=True):
-                        chip = f"<span class='{'below-chip' if is_below else 'above-chip'}'>{'📉 MA 아래' if is_below else '📈 MA 위'}</span>"
+                        chip = (
+                            f"<span class=\"{'below-chip' if is_below else 'above-chip'}\">"
+                            f"{'📉 MA 아래' if is_below else '📈 MA 위'}</span>"
+                        )
                         st.markdown(f"**{r['Symbol']}** &nbsp; {chip}", unsafe_allow_html=True)
                         st.caption(f"{r['Company']} · {r['Sector']}")
                         c1, c2 = st.columns(2)
@@ -868,13 +965,15 @@ if "results" in st.session_state:
                         if is_below and r.get("High52"):
                             c3, c4 = st.columns(2)
                             c3.metric("52W 고점", f"${r['High52']:,.2f}")
-                            c4.metric("고점 대비", f"{r['Drawdown%']:.1f}%" if r.get("Drawdown%") else "N/A",
-                                      delta_color="inverse")
+                            c4.metric(
+                                "고점 대비",
+                                f"{r['Drawdown%']:.1f}%" if r.get("Drawdown%") else "N/A",
+                                delta_color="inverse",
+                            )
                         c5, c6 = st.columns(2)
                         c5.metric("Fwd P/E",   f"{r['Fwd PE']:.1f}x"  if r.get("Fwd PE")  else "N/A")
                         c6.metric("Trail P/E", f"{r['Trail PE']:.1f}x" if r.get("Trail PE") else "N/A")
 
-                        # ── ★ 애널리스트 별점 섹션 ─────────────────
                         st.markdown("**📊 애널리스트 별점**")
                         if r.get("Rating Mean") is not None:
                             rkey    = r.get("Rating Key", "N/A")
@@ -890,34 +989,35 @@ if "results" in st.session_state:
                             )
                         else:
                             st.caption("애널리스트 데이터 없음")
-                        # ─────────────────────────────────────────────
 
                         st.markdown("**EPS 서프라이즈**")
                         for qi, q in enumerate(r["EPS Details"], 1):
                             chip_cls = "beat-chip" if q["beat"] else "miss-chip"
                             sign = "+" if q["surprise"] >= 0 else ""
                             st.markdown(
-                                f"Q-{qi} `{q['date']}` Est:`{q['estimate']}` Rep:`{q['reported']}` "
+                                f"Q-{qi} `{q['date']}` Est:`{q['estimate']}` "
+                                f"Rep:`{q['reported']}` "
                                 f"<span class='{chip_cls}'>{sign}{q['surprise']:.1f}%</span>",
                                 unsafe_allow_html=True,
                             )
 
-        # ── 다운로드 ──────────────────────────────────────────────
+        # ── 다운로드 ────────────────────────────────────────────────
         def build_markdown(results_list, run_dt, n_q, mcap_b, ratio, is_below_mode):
             lines = [
                 f"# {'📉 저평가 역발상' if is_below_mode else '📈 강세 추세 추종'} 스크리닝 결과", "",
                 f"> **기준일**: {run_dt}  ",
                 f"> **모드**: {'200일선 아래 저평가' if is_below_mode else '200일선 위 강세'}  ",
-                f"> **조건**: 최근 {n_q}분기 연속 EPS 비트 | 현재가/MA200 {'≤' if is_below_mode else '≥'} {ratio:.0%} | 시총 ≥ ${mcap_b}B  ",
+                f"> **조건**: 최근 {n_q}분기 연속 EPS 비트 | "
+                f"현재가/MA200 {'≤' if is_below_mode else '≥'} {ratio:.0%} | "
+                f"시총 ≥ ${mcap_b}B  ",
                 f"> **통과 종목**: {len(results_list)}개", "", "---", "",
             ]
             for r in results_list:
                 fpe  = f"{r['Fwd PE']:.1f}x"  if r.get("Fwd PE")  else "N/A"
                 tpe  = f"{r['Trail PE']:.1f}x" if r.get("Trail PE") else "N/A"
                 feps = f"${r['Fwd EPS']:.2f}"  if r.get("Fwd EPS") else "N/A"
-                # 별점 마크다운
                 if r.get("Rating Mean") is not None:
-                    stars_md = "⭐" * (r.get("Rating Stars") or 0)
+                    stars_md  = "⭐" * (r.get("Rating Stars") or 0)
                     rating_md = f"{stars_md} {r['Rating Mean']:.2f} ({r.get('Rating Key','N/A')})"
                     if r.get("# Analysts"):
                         rating_md += f", 분석가 {r['# Analysts']}명"
@@ -926,7 +1026,7 @@ if "results" in st.session_state:
                 lines += [
                     f"## {r['Symbol']} — {r['Company']}",
                     f"**섹터**: {r['Sector']}  ", "",
-                    f"| 항목 | 값 |", f"|------|-----|",
+                    "| 항목 | 값 |", "|------|-----|",
                     f"| 현재가 | ${r['Price']:,.2f} |",
                     f"| 200일선 | ${r['MA200']:,.2f} |",
                     f"| Price / MA200 | {r['Price/MA200']:.2%} |",
@@ -934,10 +1034,11 @@ if "results" in st.session_state:
                 if is_below_mode:
                     lines += [
                         f"| 52주 고점 | ${r['High52']:,.2f} |" if r.get("High52") else "| 52주 고점 | N/A |",
-                        f"| 고점 대비 하락 | {r['Drawdown%']:.1f}% |" if r.get("Drawdown%") is not None else "| 고점 대비 하락 | N/A |",
+                        f"| 고점 대비 하락 | {r['Drawdown%']:.1f}% |"
+                        if r.get("Drawdown%") is not None else "| 고점 대비 하락 | N/A |",
                     ]
                 lines += [
-                    f"| 애널리스트 별점 | {rating_md} |",   # ← 신규
+                    f"| 애널리스트 별점 | {rating_md} |",
                     f"| Forward P/E | {fpe} |",
                     f"| Trailing P/E | {tpe} |",
                     f"| Forward EPS | {feps} |",
@@ -949,16 +1050,26 @@ if "results" in st.session_state:
                 for qi, q in enumerate(r["EPS Details"], 1):
                     sign = "+" if q["surprise"] >= 0 else ""
                     icon = "✅" if q["beat"] else "❌"
-                    lines.append(f"| Q-{qi} | {q['date']} | {q['estimate']} | {q['reported']} | {icon} {sign}{q['surprise']:.1f}% |")
+                    lines.append(
+                        f"| Q-{qi} | {q['date']} | {q['estimate']} | "
+                        f"{q['reported']} | {icon} {sign}{q['surprise']:.1f}% |"
+                    )
                 lines += ["", "---", ""]
-            lines.append("*Generated by EPS Beat Screener*")
+            lines.append("*Generated by EPS Beat Screener (Optimized)*")
             return "\n".join(lines)
 
         csv = pd.DataFrame(summary_rows).to_csv(index=False, encoding="utf-8-sig")
-        md  = build_markdown(filtered, run_date, n_quarters, min_mcap_b, ma_ratio_threshold, is_below)
+        md  = build_markdown(filtered, run_date, n_quarters, min_mcap_b,
+                             ma_ratio_threshold, is_below)
 
         dl1, dl2 = st.columns(2)
-        dl1.download_button("📥 CSV 다운로드", data=csv,
-            file_name=f"eps_screener_{date.today()}.csv", mime="text/csv", use_container_width=True)
-        dl2.download_button("📝 Markdown 다운로드", data=md.encode("utf-8"),
-            file_name=f"eps_screener_{date.today()}.md", mime="text/markdown", use_container_width=True)
+        dl1.download_button(
+            "📥 CSV 다운로드", data=csv,
+            file_name=f"eps_screener_{date.today()}.csv",
+            mime="text/csv", use_container_width=True,
+        )
+        dl2.download_button(
+            "📝 Markdown 다운로드", data=md.encode("utf-8"),
+            file_name=f"eps_screener_{date.today()}.md",
+            mime="text/markdown", use_container_width=True,
+        )
