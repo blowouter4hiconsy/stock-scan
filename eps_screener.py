@@ -635,7 +635,6 @@ with col_reset:
     if st.button("🗑️ 초기화", use_container_width=True):
         st.session_state.pop('results', None)
         st.session_state.pop('run_date', None)
-        get_universe.clear()
         _get_universe_cached.clear()
         st.rerun()
 
