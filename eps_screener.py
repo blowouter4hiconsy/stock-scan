@@ -69,170 +69,132 @@ with st.sidebar:
 # ──────────────────────────────────────────
 # 데이터 로딩 함수
 # ──────────────────────────────────────────
-@st.cache_data(ttl=86400)   # 하루 1회 갱신 (Russell 1000은 분기 리밸런싱)
+@st.cache_data(ttl=86400)
 def get_universe(source: str = "Russell 1000 (iShares IWB)"):
     """
     종목 유니버스 로딩
-    - Russell 1000: iShares IWB CSV (시총 상위 ~1000개, API 키 불필요)
-    - S&P 500: 위키피디아 파싱
+    1순위: iShares IWB CSV (Russell 1000)
+    2순위: stockanalysis.com 파싱
+    3순위: Wikipedia S&P 500
+    4순위: 내장 100종목
     """
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
+    ihdr = {
+        "User-Agent":     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer":        "https://www.ishares.com/us/products/239707/ishares-russell-1000-etf",
+        "Accept":         "text/csv,application/octet-stream,*/*",
+        "Accept-Language":"en-US,en;q=0.9",
     }
+    ghdr = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
 
-    # ── Russell 1000 (iShares IWB CSV) ──────────────────────────────
+    errors = []
+
+    # ── 1. iShares IWB CSV ────────────────────────────────────────
     if "Russell" in source:
-        iwb_url = (
-            "https://www.ishares.com/us/products/239707/"
-            "ishares-russell-1000-etf/1467271812596.ajax"
-            "?tab=holdings&fileType=csv"
-        )
-        try:
-            resp = requests.get(iwb_url, headers=headers, timeout=20)
-            resp.raise_for_status()
-            lines = resp.text.splitlines()
-            # CSV 앞부분 메타데이터 제거: 'Ticker' 헤더 행 찾기
-            start = next(i for i, l in enumerate(lines) if l.startswith('"Ticker"') or l.startswith('Ticker'))
-            clean_csv = "\n".join(lines[start:])
-            df_raw = pd.read_csv(io.StringIO(clean_csv))
-            df_raw.columns = df_raw.columns.str.strip().str.replace('"', '')
-            # 주식(Equity)만 필터, 현금·선물 제외
-            df_raw = df_raw[df_raw['Asset Class'].str.strip() == 'Equity'].copy()
-            df_raw = df_raw.rename(columns={
-                'Ticker': 'Symbol',
-                'Name':   'Company',
-                'Sector': 'Sector',
-            })
-            df_raw['Symbol'] = df_raw['Symbol'].str.strip().str.replace('"', '').str.replace('.', '-', regex=False)
-            df_raw['Company'] = df_raw['Company'].str.strip().str.replace('"', '')
-            df_raw['Sector']  = df_raw['Sector'].str.strip().str.replace('"', '')
-            return df_raw[['Symbol', 'Company', 'Sector']].reset_index(drop=True)
-        except Exception as e:
-            st.warning(f"iShares Russell 1000 로딩 실패 → S&P 500으로 대체합니다. ({e})")
-            source = "S&P 500 (Wikipedia)"   # fallback
+        for url in [
+            "https://www.ishares.com/us/products/239707/ishares-russell-1000-etf/1467271812596.ajax?fileType=csv&fileName=IWB_holdings&dataType=fund",
+            "https://www.ishares.com/us/products/239707/ISHARES-RUSSELL-1000-ETF/1467271812596.ajax?fileType=csv&fileName=IWB_holdings&dataType=fund",
+        ]:
+            try:
+                resp = requests.get(url, headers=ihdr, timeout=25)
+                resp.raise_for_status()
+                lines = resp.text.splitlines()
+                start = next(
+                    (i for i, l in enumerate(lines)
+                     if l.strip().lstrip('"').startswith("Ticker")),
+                    None
+                )
+                if start is None:
+                    raise ValueError("Ticker 헤더 없음")
+                df_raw = pd.read_csv(io.StringIO("\n".join(lines[start:])))
+                df_raw.columns = df_raw.columns.str.strip().str.replace('"', '')
+                df_raw = df_raw[df_raw["Asset Class"].str.strip() == "Equity"].copy()
+                df_raw = df_raw.rename(columns={"Ticker": "Symbol", "Name": "Company", "Sector": "Sector"})
+                df_raw["Symbol"]  = df_raw["Symbol"].str.strip().str.replace('"', '').str.replace(".", "-", regex=False)
+                df_raw["Company"] = df_raw["Company"].str.strip().str.replace('"', '')
+                df_raw["Sector"]  = df_raw["Sector"].str.strip().str.replace('"', '')
+                df_out = df_raw[["Symbol", "Company", "Sector"]].dropna(subset=["Symbol"]).reset_index(drop=True)
+                if len(df_out) > 100:
+                    return df_out
+                raise ValueError(f"종목 수 부족: {len(df_out)}")
+            except Exception as e:
+                errors.append(f"iShares: {e}")
 
-    # ── S&P 500 (Wikipedia) ─────────────────────────────────────────
-    if "S&P" in source:
-        sp_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        # ── 2. stockanalysis.com ──────────────────────────────────
         try:
-            resp = requests.get(sp_url, headers=headers, timeout=15)
+            resp = requests.get("https://stockanalysis.com/list/russell-1000-stocks/", headers=ghdr, timeout=20)
             resp.raise_for_status()
-            df = pd.read_html(io.StringIO(resp.text))[0]
-            df = df[['Symbol', 'Security', 'GICS Sector']].rename(
-                columns={'Security': 'Company', 'GICS Sector': 'Sector'}
-            )
-            df['Symbol'] = df['Symbol'].str.replace('.', '-', regex=False)
-            return df
+            tables = pd.read_html(io.StringIO(resp.text))
+            df_sa  = tables[0]
+            col_map = {}
+            for c in df_sa.columns:
+                cl = str(c).lower()
+                if "symbol" in cl or "ticker" in cl: col_map[c] = "Symbol"
+                elif "name" in cl or "company" in cl: col_map[c] = "Company"
+            df_sa = df_sa.rename(columns=col_map)
+            if "Symbol" not in df_sa.columns:
+                raise ValueError("Symbol 컬럼 없음")
+            if "Company" not in df_sa.columns:
+                df_sa["Company"] = df_sa["Symbol"]
+            df_sa["Sector"] = "N/A"
+            df_sa["Symbol"] = df_sa["Symbol"].astype(str).str.strip().str.replace(".", "-", regex=False)
+            df_out = df_sa[["Symbol", "Company", "Sector"]].dropna(subset=["Symbol"]).reset_index(drop=True)
+            if len(df_out) > 100:
+                st.info(f"stockanalysis.com에서 {len(df_out)}개 종목 로딩 완료")
+                return df_out
+            raise ValueError(f"종목 수 부족: {len(df_out)}")
         except Exception as e:
-            st.warning(f"위키피디아 로딩 실패, 내장 대표 종목 100개로 대체합니다. ({e})")
-        # ── 폴백: 대표 대형주 100종목 하드코딩 ──
-        fallback = [
-            ("AAPL","Apple Inc.","Information Technology"),
-            ("MSFT","Microsoft Corp.","Information Technology"),
-            ("NVDA","NVIDIA Corp.","Information Technology"),
-            ("AMZN","Amazon.com Inc.","Consumer Discretionary"),
-            ("GOOGL","Alphabet Inc. Cl A","Communication Services"),
-            ("GOOG","Alphabet Inc. Cl C","Communication Services"),
-            ("META","Meta Platforms Inc.","Communication Services"),
-            ("BRK-B","Berkshire Hathaway Cl B","Financials"),
-            ("TSLA","Tesla Inc.","Consumer Discretionary"),
-            ("LLY","Eli Lilly & Co.","Health Care"),
-            ("JPM","JPMorgan Chase & Co.","Financials"),
-            ("V","Visa Inc.","Financials"),
-            ("UNH","UnitedHealth Group Inc.","Health Care"),
-            ("XOM","Exxon Mobil Corp.","Energy"),
-            ("MA","Mastercard Inc.","Financials"),
-            ("AVGO","Broadcom Inc.","Information Technology"),
-            ("HD","Home Depot Inc.","Consumer Discretionary"),
-            ("PG","Procter & Gamble Co.","Consumer Staples"),
-            ("JNJ","Johnson & Johnson","Health Care"),
-            ("MRK","Merck & Co. Inc.","Health Care"),
-            ("ABBV","AbbVie Inc.","Health Care"),
-            ("CRM","Salesforce Inc.","Information Technology"),
-            ("COST","Costco Wholesale Corp.","Consumer Staples"),
-            ("AMD","Advanced Micro Devices","Information Technology"),
-            ("NFLX","Netflix Inc.","Communication Services"),
-            ("TMO","Thermo Fisher Scientific","Health Care"),
-            ("PEP","PepsiCo Inc.","Consumer Staples"),
-            ("KO","Coca-Cola Co.","Consumer Staples"),
-            ("WMT","Walmart Inc.","Consumer Staples"),
-            ("ACN","Accenture PLC","Information Technology"),
-            ("MCD","McDonald's Corp.","Consumer Discretionary"),
-            ("CSCO","Cisco Systems Inc.","Information Technology"),
-            ("ABT","Abbott Laboratories","Health Care"),
-            ("NKE","Nike Inc.","Consumer Discretionary"),
-            ("DHR","Danaher Corp.","Health Care"),
-            ("ORCL","Oracle Corp.","Information Technology"),
-            ("TXN","Texas Instruments Inc.","Information Technology"),
-            ("BAC","Bank of America Corp.","Financials"),
-            ("INTC","Intel Corp.","Information Technology"),
-            ("QCOM","Qualcomm Inc.","Information Technology"),
-            ("AMAT","Applied Materials Inc.","Information Technology"),
-            ("HON","Honeywell International","Industrials"),
-            ("PM","Philip Morris International","Consumer Staples"),
-            ("CAT","Caterpillar Inc.","Industrials"),
-            ("GE","GE Aerospace","Industrials"),
-            ("RTX","RTX Corp.","Industrials"),
-            ("AMGN","Amgen Inc.","Health Care"),
-            ("GILD","Gilead Sciences Inc.","Health Care"),
-            ("LOW","Lowe's Companies Inc.","Consumer Discretionary"),
-            ("SPGI","S&P Global Inc.","Financials"),
-            ("BLK","BlackRock Inc.","Financials"),
-            ("GS","Goldman Sachs Group","Financials"),
-            ("MS","Morgan Stanley","Financials"),
-            ("SCHW","Charles Schwab Corp.","Financials"),
-            ("CB","Chubb Ltd.","Financials"),
-            ("AXP","American Express Co.","Financials"),
-            ("BMY","Bristol-Myers Squibb","Health Care"),
-            ("CVX","Chevron Corp.","Energy"),
-            ("COP","ConocoPhillips","Energy"),
-            ("SLB","SLB (Schlumberger)","Energy"),
-            ("DE","Deere & Company","Industrials"),
-            ("UPS","United Parcel Service","Industrials"),
-            ("MMM","3M Co.","Industrials"),
-            ("LMT","Lockheed Martin Corp.","Industrials"),
-            ("BA","Boeing Co.","Industrials"),
-            ("NEE","NextEra Energy Inc.","Utilities"),
-            ("DUK","Duke Energy Corp.","Utilities"),
-            ("SO","Southern Co.","Utilities"),
-            ("T","AT&T Inc.","Communication Services"),
-            ("VZ","Verizon Communications","Communication Services"),
-            ("CMCSA","Comcast Corp.","Communication Services"),
-            ("DIS","Walt Disney Co.","Communication Services"),
-            ("ADBE","Adobe Inc.","Information Technology"),
-            ("NOW","ServiceNow Inc.","Information Technology"),
-            ("INTU","Intuit Inc.","Information Technology"),
-            ("SNPS","Synopsys Inc.","Information Technology"),
-            ("CDNS","Cadence Design Systems","Information Technology"),
-            ("KLAC","KLA Corp.","Information Technology"),
-            ("LRCX","Lam Research Corp.","Information Technology"),
-            ("MU","Micron Technology Inc.","Information Technology"),
-            ("MRVL","Marvell Technology Inc.","Information Technology"),
-            ("ARM","Arm Holdings PLC","Information Technology"),
-            ("PANW","Palo Alto Networks","Information Technology"),
-            ("CRWD","CrowdStrike Holdings","Information Technology"),
-            ("SNOW","Snowflake Inc.","Information Technology"),
-            ("DDOG","Datadog Inc.","Information Technology"),
-            ("ZS","Zscaler Inc.","Information Technology"),
-            ("TTD","Trade Desk Inc.","Communication Services"),
-            ("UBER","Uber Technologies Inc.","Industrials"),
-            ("ABNB","Airbnb Inc.","Consumer Discretionary"),
-            ("BKNG","Booking Holdings Inc.","Consumer Discretionary"),
-            ("SBUX","Starbucks Corp.","Consumer Discretionary"),
-            ("TGT","Target Corp.","Consumer Staples"),
-            ("CVS","CVS Health Corp.","Health Care"),
-            ("CI","Cigna Group","Health Care"),
-            ("HUM","Humana Inc.","Health Care"),
-            ("ISRG","Intuitive Surgical Inc.","Health Care"),
-            ("SYK","Stryker Corp.","Health Care"),
-            ("ELV","Elevance Health Inc.","Health Care"),
-        ]
-        df = pd.DataFrame(fallback, columns=['Symbol', 'Company', 'Sector'])
+            errors.append(f"stockanalysis: {e}")
+
+        st.warning("Russell 1000 로딩 실패 — S&P 500으로 대체합니다.\n\n" + " / ".join(errors))
+        source = "S&P 500"
+
+    # ── 3. Wikipedia S&P 500 ─────────────────────────────────────
+    try:
+        resp = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", headers=ghdr, timeout=15)
+        resp.raise_for_status()
+        df = pd.read_html(io.StringIO(resp.text))[0]
+        df = df[["Symbol", "Security", "GICS Sector"]].rename(
+            columns={"Security": "Company", "GICS Sector": "Sector"}
+        )
+        df["Symbol"] = df["Symbol"].str.replace(".", "-", regex=False)
         return df
+    except Exception as e:
+        st.warning(f"Wikipedia S&P 500 실패, 내장 종목 사용. ({e})")
+
+    # ── 4. 내장 100종목 ───────────────────────────────────────────
+    fallback = [
+        ("AAPL","Apple Inc.","Information Technology"),("MSFT","Microsoft Corp.","Information Technology"),
+        ("NVDA","NVIDIA Corp.","Information Technology"),("AMZN","Amazon.com Inc.","Consumer Discretionary"),
+        ("GOOGL","Alphabet Inc. Cl A","Communication Services"),("META","Meta Platforms Inc.","Communication Services"),
+        ("BRK-B","Berkshire Hathaway Cl B","Financials"),("TSLA","Tesla Inc.","Consumer Discretionary"),
+        ("LLY","Eli Lilly & Co.","Health Care"),("JPM","JPMorgan Chase & Co.","Financials"),
+        ("V","Visa Inc.","Financials"),("UNH","UnitedHealth Group Inc.","Health Care"),
+        ("XOM","Exxon Mobil Corp.","Energy"),("MA","Mastercard Inc.","Financials"),
+        ("AVGO","Broadcom Inc.","Information Technology"),("HD","Home Depot Inc.","Consumer Discretionary"),
+        ("PG","Procter & Gamble Co.","Consumer Staples"),("JNJ","Johnson & Johnson","Health Care"),
+        ("MRK","Merck & Co. Inc.","Health Care"),("ABBV","AbbVie Inc.","Health Care"),
+        ("CRM","Salesforce Inc.","Information Technology"),("COST","Costco Wholesale Corp.","Consumer Staples"),
+        ("AMD","Advanced Micro Devices","Information Technology"),("NFLX","Netflix Inc.","Communication Services"),
+        ("TMO","Thermo Fisher Scientific","Health Care"),("PEP","PepsiCo Inc.","Consumer Staples"),
+        ("KO","Coca-Cola Co.","Consumer Staples"),("WMT","Walmart Inc.","Consumer Staples"),
+        ("ORCL","Oracle Corp.","Information Technology"),("TXN","Texas Instruments Inc.","Information Technology"),
+        ("BAC","Bank of America Corp.","Financials"),("QCOM","Qualcomm Inc.","Information Technology"),
+        ("AMAT","Applied Materials Inc.","Information Technology"),("HON","Honeywell International","Industrials"),
+        ("CAT","Caterpillar Inc.","Industrials"),("GE","GE Aerospace","Industrials"),
+        ("AMGN","Amgen Inc.","Health Care"),("LOW","Lowe's Companies Inc.","Consumer Discretionary"),
+        ("GS","Goldman Sachs Group","Financials"),("MS","Morgan Stanley","Financials"),
+        ("CVX","Chevron Corp.","Energy"),("COP","ConocoPhillips","Energy"),
+        ("DE","Deere & Company","Industrials"),("LMT","Lockheed Martin Corp.","Industrials"),
+        ("NEE","NextEra Energy Inc.","Utilities"),("ADBE","Adobe Inc.","Information Technology"),
+        ("NOW","ServiceNow Inc.","Information Technology"),("INTU","Intuit Inc.","Information Technology"),
+        ("KLAC","KLA Corp.","Information Technology"),("LRCX","Lam Research Corp.","Information Technology"),
+        ("MU","Micron Technology Inc.","Information Technology"),("MRVL","Marvell Technology Inc.","Information Technology"),
+        ("ARM","Arm Holdings PLC","Information Technology"),("PANW","Palo Alto Networks","Information Technology"),
+        ("CRWD","CrowdStrike Holdings","Information Technology"),("UBER","Uber Technologies Inc.","Industrials"),
+        ("BKNG","Booking Holdings Inc.","Consumer Discretionary"),("ISRG","Intuitive Surgical Inc.","Health Care"),
+        ("VRT","Vertiv Holdings","Industrials"),("GEV","GE Vernova","Industrials"),
+    ]
+    return pd.DataFrame(fallback, columns=["Symbol", "Company", "Sector"])
 
 
 def get_eps_beat_info(ticker_obj, n_quarters: int):
