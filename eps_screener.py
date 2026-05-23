@@ -59,35 +59,76 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 📋 종목 범위")
-    universe = st.radio("스크리닝 대상", ["S&P 500 전체 (~500종목)", "테스트 (상위 50종목)"])
-    st.caption("전체 스캔 시 10~20분 소요됩니다.")
+    universe_src = st.radio("스크리닝 대상", [
+        "Russell 1000 (iShares IWB) — 시총 상위 ~1000종목",
+        "S&P 500 (Wikipedia) — 500종목",
+        "테스트 (상위 50종목)",
+    ])
+    st.caption("Russell 1000 전체 스캔 시 20~30분 소요됩니다.")
 
 # ──────────────────────────────────────────
 # 데이터 로딩 함수
 # ──────────────────────────────────────────
-@st.cache_data(ttl=3600)
-def get_sp500_list():
-    """S&P 500 종목 목록 가져오기 (위키피디아, User-Agent 헤더 포함)"""
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+@st.cache_data(ttl=86400)   # 하루 1회 갱신 (Russell 1000은 분기 리밸런싱)
+def get_universe(source: str = "Russell 1000 (iShares IWB)"):
+    """
+    종목 유니버스 로딩
+    - Russell 1000: iShares IWB CSV (시총 상위 ~1000개, API 키 불필요)
+    - S&P 500: 위키피디아 파싱
+    """
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept-Language": "en-US,en;q=0.9",
     }
-    try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        resp.raise_for_status()
-        df = pd.read_html(io.StringIO(resp.text))[0]
-        df = df[['Symbol', 'Security', 'GICS Sector']].rename(
-            columns={'Security': 'Company', 'GICS Sector': 'Sector'}
+
+    # ── Russell 1000 (iShares IWB CSV) ──────────────────────────────
+    if "Russell" in source:
+        iwb_url = (
+            "https://www.ishares.com/us/products/239707/"
+            "ishares-russell-1000-etf/1467271812596.ajax"
+            "?tab=holdings&fileType=csv"
         )
-        df['Symbol'] = df['Symbol'].str.replace('.', '-', regex=False)
-        return df
-    except Exception as e:
-        st.warning(f"위키피디아 로딩 실패, 내장 대표 종목 100개로 대체합니다. ({e})")
+        try:
+            resp = requests.get(iwb_url, headers=headers, timeout=20)
+            resp.raise_for_status()
+            lines = resp.text.splitlines()
+            # CSV 앞부분 메타데이터 제거: 'Ticker' 헤더 행 찾기
+            start = next(i for i, l in enumerate(lines) if l.startswith('"Ticker"') or l.startswith('Ticker'))
+            clean_csv = "\n".join(lines[start:])
+            df_raw = pd.read_csv(io.StringIO(clean_csv))
+            df_raw.columns = df_raw.columns.str.strip().str.replace('"', '')
+            # 주식(Equity)만 필터, 현금·선물 제외
+            df_raw = df_raw[df_raw['Asset Class'].str.strip() == 'Equity'].copy()
+            df_raw = df_raw.rename(columns={
+                'Ticker': 'Symbol',
+                'Name':   'Company',
+                'Sector': 'Sector',
+            })
+            df_raw['Symbol'] = df_raw['Symbol'].str.strip().str.replace('"', '').str.replace('.', '-', regex=False)
+            df_raw['Company'] = df_raw['Company'].str.strip().str.replace('"', '')
+            df_raw['Sector']  = df_raw['Sector'].str.strip().str.replace('"', '')
+            return df_raw[['Symbol', 'Company', 'Sector']].reset_index(drop=True)
+        except Exception as e:
+            st.warning(f"iShares Russell 1000 로딩 실패 → S&P 500으로 대체합니다. ({e})")
+            source = "S&P 500 (Wikipedia)"   # fallback
+
+    # ── S&P 500 (Wikipedia) ─────────────────────────────────────────
+    if "S&P" in source:
+        sp_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        try:
+            resp = requests.get(sp_url, headers=headers, timeout=15)
+            resp.raise_for_status()
+            df = pd.read_html(io.StringIO(resp.text))[0]
+            df = df[['Symbol', 'Security', 'GICS Sector']].rename(
+                columns={'Security': 'Company', 'GICS Sector': 'Sector'}
+            )
+            df['Symbol'] = df['Symbol'].str.replace('.', '-', regex=False)
+            return df
+        except Exception as e:
+            st.warning(f"위키피디아 로딩 실패, 내장 대표 종목 100개로 대체합니다. ({e})")
         # ── 폴백: 대표 대형주 100종목 하드코딩 ──
         fallback = [
             ("AAPL","Apple Inc.","Information Technology"),
@@ -371,8 +412,15 @@ with col_reset:
 # 스크리닝 실행
 # ──────────────────────────────────────────
 if run_btn:
-    sp500 = get_sp500_list()
-    if "테스트" in universe:
+    if "Russell" in universe_src:
+        src_key = "Russell 1000 (iShares IWB)"
+    elif "S&P" in universe_src:
+        src_key = "S&P 500 (Wikipedia)"
+    else:
+        src_key = "Russell 1000 (iShares IWB)"   # 테스트도 Russell 1000에서 50개
+
+    sp500 = get_universe(src_key)
+    if "테스트" in universe_src:
         sp500 = sp500.head(50)
 
     total   = len(sp500)
@@ -514,11 +562,69 @@ if 'results' in st.session_state:
                                 unsafe_allow_html=True,
                             )
 
-        # CSV 다운로드
+        # ── 다운로드 버튼 ────────────────────────────────────────
+        def build_markdown(results_list, run_dt, n_q, mcap_b, ratio):
+            lines = []
+            lines.append(f"# 📈 EPS Beat + 200일선 스크리닝 결과")
+            lines.append(f"")
+            lines.append(f"> **기준일**: {run_dt}  ")
+            lines.append(f"> **조건**: 최근 {n_q}분기 연속 EPS 비트 | 현재가/MA200 ≥ {ratio:.0%} | 시총 ≥ ${mcap_b}B  ")
+            lines.append(f"> **통과 종목**: {len(results_list)}개")
+            lines.append(f"")
+            lines.append(f"---")
+            lines.append(f"")
+
+            for r in results_list:
+                fpe  = f"{r['Fwd PE']:.1f}x"  if r.get('Fwd PE')   else "N/A"
+                tpe  = f"{r['Trail PE']:.1f}x" if r.get('Trail PE') else "N/A"
+                feps = f"${r['Fwd EPS']:.2f}"  if r.get('Fwd EPS')  else "N/A"
+
+                lines.append(f"## {r['Symbol']} — {r['Company']}")
+                lines.append(f"**섹터**: {r['Sector']}  ")
+                lines.append(f"")
+                lines.append(f"| 항목 | 값 |")
+                lines.append(f"|------|-----|")
+                lines.append(f"| 현재가 | ${r['Price']:,.2f} |")
+                lines.append(f"| 200일선 | ${r['MA200']:,.2f} |")
+                lines.append(f"| Price / MA200 | {r['Price/MA200']:.2%} |")
+                lines.append(f"| Forward P/E | {fpe} |")
+                lines.append(f"| Trailing P/E | {tpe} |")
+                lines.append(f"| Forward EPS | {feps} |")
+                lines.append(f"| 시가총액 | ${r['MCap($B)']:,.1f}B |")
+                lines.append(f"")
+                lines.append(f"**EPS 서프라이즈 (최신 → 과거)**")
+                lines.append(f"")
+                lines.append(f"| 분기 | 발표일 | 컨센서스 EPS | 실제 EPS | 서프라이즈 |")
+                lines.append(f"|------|--------|-------------|---------|-----------|")
+                for qi, q in enumerate(r['EPS Details'], 1):
+                    sign = "+" if q['surprise'] >= 0 else ""
+                    beat_icon = "✅" if q['beat'] else "❌"
+                    lines.append(
+                        f"| Q-{qi} | {q['date']} | {q['estimate']} "
+                        f"| {q['reported']} | {beat_icon} {sign}{q['surprise']:.1f}% |"
+                    )
+                lines.append(f"")
+                lines.append(f"---")
+                lines.append(f"")
+
+            lines.append(f"*Generated by EPS Beat Screener*")
+            return "\n".join(lines)
+
         csv = df_display.to_csv(index=False, encoding='utf-8-sig')
-        st.download_button(
-            "📥 결과 CSV 다운로드",
+        md  = build_markdown(filtered, run_date, n_quarters, min_mcap_b, min_price_vs_ma)
+
+        dl1, dl2 = st.columns(2)
+        dl1.download_button(
+            "📥 CSV 다운로드",
             data=csv,
             file_name=f"eps_screener_{date.today()}.csv",
             mime="text/csv",
+            use_container_width=True,
+        )
+        dl2.download_button(
+            "📝 Markdown 다운로드",
+            data=md.encode("utf-8"),
+            file_name=f"eps_screener_{date.today()}.md",
+            mime="text/markdown",
+            use_container_width=True,
         )
