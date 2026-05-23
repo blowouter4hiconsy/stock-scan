@@ -8,6 +8,8 @@ EPS Beat + 200일선 라지캡 스크리너
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import requests
+import io
 import time
 import json
 from datetime import datetime, date
@@ -58,15 +60,131 @@ with st.sidebar:
 # ──────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def get_sp500_list():
-    """위키피디아에서 S&P 500 종목 목록 가져오기"""
+    """S&P 500 종목 목록 가져오기 (위키피디아, User-Agent 헤더 포함)"""
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    df = pd.read_html(url)[0]
-    df = df[['Symbol', 'Security', 'GICS Sector']].rename(
-        columns={'Security': 'Company', 'GICS Sector': 'Sector'}
-    )
-    # 일부 티커 형식 보정 (BRK.B → BRK-B)
-    df['Symbol'] = df['Symbol'].str.replace('.', '-', regex=False)
-    return df
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        df = pd.read_html(io.StringIO(resp.text))[0]
+        df = df[['Symbol', 'Security', 'GICS Sector']].rename(
+            columns={'Security': 'Company', 'GICS Sector': 'Sector'}
+        )
+        df['Symbol'] = df['Symbol'].str.replace('.', '-', regex=False)
+        return df
+    except Exception as e:
+        st.warning(f"위키피디아 로딩 실패, 내장 대표 종목 100개로 대체합니다. ({e})")
+        # ── 폴백: 대표 대형주 100종목 하드코딩 ──
+        fallback = [
+            ("AAPL","Apple Inc.","Information Technology"),
+            ("MSFT","Microsoft Corp.","Information Technology"),
+            ("NVDA","NVIDIA Corp.","Information Technology"),
+            ("AMZN","Amazon.com Inc.","Consumer Discretionary"),
+            ("GOOGL","Alphabet Inc. Cl A","Communication Services"),
+            ("GOOG","Alphabet Inc. Cl C","Communication Services"),
+            ("META","Meta Platforms Inc.","Communication Services"),
+            ("BRK-B","Berkshire Hathaway Cl B","Financials"),
+            ("TSLA","Tesla Inc.","Consumer Discretionary"),
+            ("LLY","Eli Lilly & Co.","Health Care"),
+            ("JPM","JPMorgan Chase & Co.","Financials"),
+            ("V","Visa Inc.","Financials"),
+            ("UNH","UnitedHealth Group Inc.","Health Care"),
+            ("XOM","Exxon Mobil Corp.","Energy"),
+            ("MA","Mastercard Inc.","Financials"),
+            ("AVGO","Broadcom Inc.","Information Technology"),
+            ("HD","Home Depot Inc.","Consumer Discretionary"),
+            ("PG","Procter & Gamble Co.","Consumer Staples"),
+            ("JNJ","Johnson & Johnson","Health Care"),
+            ("MRK","Merck & Co. Inc.","Health Care"),
+            ("ABBV","AbbVie Inc.","Health Care"),
+            ("CRM","Salesforce Inc.","Information Technology"),
+            ("COST","Costco Wholesale Corp.","Consumer Staples"),
+            ("AMD","Advanced Micro Devices","Information Technology"),
+            ("NFLX","Netflix Inc.","Communication Services"),
+            ("TMO","Thermo Fisher Scientific","Health Care"),
+            ("PEP","PepsiCo Inc.","Consumer Staples"),
+            ("KO","Coca-Cola Co.","Consumer Staples"),
+            ("WMT","Walmart Inc.","Consumer Staples"),
+            ("ACN","Accenture PLC","Information Technology"),
+            ("MCD","McDonald's Corp.","Consumer Discretionary"),
+            ("CSCO","Cisco Systems Inc.","Information Technology"),
+            ("ABT","Abbott Laboratories","Health Care"),
+            ("NKE","Nike Inc.","Consumer Discretionary"),
+            ("DHR","Danaher Corp.","Health Care"),
+            ("ORCL","Oracle Corp.","Information Technology"),
+            ("TXN","Texas Instruments Inc.","Information Technology"),
+            ("BAC","Bank of America Corp.","Financials"),
+            ("INTC","Intel Corp.","Information Technology"),
+            ("QCOM","Qualcomm Inc.","Information Technology"),
+            ("AMAT","Applied Materials Inc.","Information Technology"),
+            ("HON","Honeywell International","Industrials"),
+            ("PM","Philip Morris International","Consumer Staples"),
+            ("CAT","Caterpillar Inc.","Industrials"),
+            ("GE","GE Aerospace","Industrials"),
+            ("RTX","RTX Corp.","Industrials"),
+            ("AMGN","Amgen Inc.","Health Care"),
+            ("GILD","Gilead Sciences Inc.","Health Care"),
+            ("LOW","Lowe's Companies Inc.","Consumer Discretionary"),
+            ("SPGI","S&P Global Inc.","Financials"),
+            ("BLK","BlackRock Inc.","Financials"),
+            ("GS","Goldman Sachs Group","Financials"),
+            ("MS","Morgan Stanley","Financials"),
+            ("SCHW","Charles Schwab Corp.","Financials"),
+            ("CB","Chubb Ltd.","Financials"),
+            ("AXP","American Express Co.","Financials"),
+            ("BMY","Bristol-Myers Squibb","Health Care"),
+            ("CVX","Chevron Corp.","Energy"),
+            ("COP","ConocoPhillips","Energy"),
+            ("SLB","SLB (Schlumberger)","Energy"),
+            ("DE","Deere & Company","Industrials"),
+            ("UPS","United Parcel Service","Industrials"),
+            ("MMM","3M Co.","Industrials"),
+            ("LMT","Lockheed Martin Corp.","Industrials"),
+            ("BA","Boeing Co.","Industrials"),
+            ("NEE","NextEra Energy Inc.","Utilities"),
+            ("DUK","Duke Energy Corp.","Utilities"),
+            ("SO","Southern Co.","Utilities"),
+            ("T","AT&T Inc.","Communication Services"),
+            ("VZ","Verizon Communications","Communication Services"),
+            ("CMCSA","Comcast Corp.","Communication Services"),
+            ("DIS","Walt Disney Co.","Communication Services"),
+            ("ADBE","Adobe Inc.","Information Technology"),
+            ("NOW","ServiceNow Inc.","Information Technology"),
+            ("INTU","Intuit Inc.","Information Technology"),
+            ("SNPS","Synopsys Inc.","Information Technology"),
+            ("CDNS","Cadence Design Systems","Information Technology"),
+            ("KLAC","KLA Corp.","Information Technology"),
+            ("LRCX","Lam Research Corp.","Information Technology"),
+            ("MU","Micron Technology Inc.","Information Technology"),
+            ("MRVL","Marvell Technology Inc.","Information Technology"),
+            ("ARM","Arm Holdings PLC","Information Technology"),
+            ("PANW","Palo Alto Networks","Information Technology"),
+            ("CRWD","CrowdStrike Holdings","Information Technology"),
+            ("SNOW","Snowflake Inc.","Information Technology"),
+            ("DDOG","Datadog Inc.","Information Technology"),
+            ("ZS","Zscaler Inc.","Information Technology"),
+            ("TTD","Trade Desk Inc.","Communication Services"),
+            ("UBER","Uber Technologies Inc.","Industrials"),
+            ("ABNB","Airbnb Inc.","Consumer Discretionary"),
+            ("BKNG","Booking Holdings Inc.","Consumer Discretionary"),
+            ("SBUX","Starbucks Corp.","Consumer Discretionary"),
+            ("TGT","Target Corp.","Consumer Staples"),
+            ("CVS","CVS Health Corp.","Health Care"),
+            ("CI","Cigna Group","Health Care"),
+            ("HUM","Humana Inc.","Health Care"),
+            ("ISRG","Intuitive Surgical Inc.","Health Care"),
+            ("SYK","Stryker Corp.","Health Care"),
+            ("ELV","Elevance Health Inc.","Health Care"),
+        ]
+        df = pd.DataFrame(fallback, columns=['Symbol', 'Company', 'Sector'])
+        return df
 
 
 def get_eps_beat_info(ticker_obj, n_quarters: int):
