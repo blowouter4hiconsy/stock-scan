@@ -10,6 +10,7 @@ import yfinance as yf
 import pandas as pd
 import requests
 import io
+import re
 import time
 import json
 from datetime import datetime, date
@@ -19,23 +20,23 @@ import traceback
 # 페이지 설정
 # ──────────────────────────────────────────
 st.set_page_config(
-page_title="EPS Beat 스크리너",
-page_icon="📈",
-layout="wide",
-initial_sidebar_state="expanded",
+    page_title="EPS Beat 스크리너",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 st.markdown("""
 <style>
-   .main-title { font-size: 2rem; font-weight: 700; color: #1a73e8; }
-   .sub-title  { font-size: 1rem; color: #666; margin-bottom: 1.5rem; }
-   .metric-box { background: #f0f4ff; border-radius: 8px; padding: 12px 16px; margin: 4px 0; }
-   .beat-chip  { display: inline-block; background: #e6f4ea; color: #1e7e34;
-                 border-radius: 12px; padding: 2px 10px; font-size: 0.78rem; font-weight: 600; }
-   .miss-chip  { display: inline-block; background: #fce8e6; color: #c62828;
-                 border-radius: 12px; padding: 2px 10px; font-size: 0.78rem; font-weight: 600; }
-   .stProgress > div > div { background: #1a73e8; }
-   div[data-testid="stSidebar"] { background: #f7f9fc; }
+    .main-title { font-size: 2rem; font-weight: 700; color: #1a73e8; }
+    .sub-title  { font-size: 1rem; color: #666; margin-bottom: 1.5rem; }
+    .metric-box { background: #f0f4ff; border-radius: 8px; padding: 12px 16px; margin: 4px 0; }
+    .beat-chip  { display: inline-block; background: #e6f4ea; color: #1e7e34;
+                  border-radius: 12px; padding: 2px 10px; font-size: 0.78rem; font-weight: 600; }
+    .miss-chip  { display: inline-block; background: #fce8e6; color: #c62828;
+                  border-radius: 12px; padding: 2px 10px; font-size: 0.78rem; font-weight: 600; }
+    .stProgress > div > div { background: #1a73e8; }
+    div[data-testid="stSidebar"] { background: #f7f9fc; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -43,11 +44,11 @@ st.markdown("""
 # 사이드바 설정
 # ──────────────────────────────────────────
 with st.sidebar:
-st.markdown("## ⚙️ 스크리닝 조건")
-n_quarters = st.slider("연속 EPS 비트 분기 수", 1, 5, 3)
-min_mcap_b = st.slider("최소 시가총액 (십억 달러)", 1, 50, 10)
-min_price_vs_ma = st.slider("현재가 / 200일선 최소 비율", 1.00, 1.20, 1.00, 0.01,
-help="1.05 → 200일선보다 5% 이상 위에 있어야 통과")
+    st.markdown("## ⚙️ 스크리닝 조건")
+    n_quarters = st.slider("연속 EPS 비트 분기 수", 1, 5, 3)
+    min_mcap_b = st.slider("최소 시가총액 (십억 달러)", 1, 50, 10)
+    min_price_vs_ma = st.slider("현재가 / 200일선 최소 비율", 1.00, 1.20, 1.00, 0.01,
+                                help="1.05 → 200일선보다 5% 이상 위에 있어야 통과")
 
     st.markdown("---")
     st.markdown("### 📊 Valuation 필터")
@@ -55,14 +56,434 @@ help="1.05 → 200일선보다 5% 이상 위에 있어야 통과")
     max_fwd_pe = st.slider("Forward P/E 최대값", 10, 100, 40, 1,
                            disabled=not use_fpe_filter,
                            help="Forward P/E가 이 값보다 낮은 종목만 통과 (데이터 없는 종목은 통과 처리)")
-request_delay = st.slider("종목당 API 딜레이 (초)", 0.1, 1.0, 0.3, 0.1)
+    request_delay = st.slider("종목당 API 딜레이 (초)", 0.1, 1.0, 0.3, 0.1)
 
-st.markdown("---")
-@@ -248,7 +255,49 @@
-return None
+    st.markdown("---")
+    st.markdown("### 📋 종목 범위")
+    universe_src = st.radio("스크리닝 대상", [
+        "Russell 1000 (iShares IWB) — 시총 상위 ~1000종목",
+        "S&P 500 (Wikipedia) — 500종목",
+        "테스트 (상위 50종목)",
+    ])
+    st.caption("Russell 1000 전체 스캔 시 20~30분 소요됩니다.")
+
+# ──────────────────────────────────────────
+# 데이터 로딩 함수
+# ──────────────────────────────────────────
+ISHARES_IWB_PRODUCT = "https://www.ishares.com/us/products/239707/ishares-russell-1000-etf"
+TRENDSPIDER_R1000_URL = "https://trendspider.com/learning-center/russell-1000-index/"
 
 
-def screen_ticker(row, n_quarters, min_mcap_b, min_price_vs_ma):
+def _browser_headers(referer: str | None = None, accept_csv: bool = False) -> dict:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if accept_csv:
+        headers["Accept"] = "text/csv,application/octet-stream,*/*"
+        headers["Referer"] = referer or ISHARES_IWB_PRODUCT
+    else:
+        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    if referer:
+        headers["Referer"] = referer
+    return headers
+
+
+def _normalize_symbol(ticker: str) -> str:
+    sym = str(ticker).strip().upper().replace('"', "")
+    sym = sym.replace("/", "-")
+    if sym in ("BRKB", "BRK B"):
+        return "BRK-B"
+    if "." in sym:
+        return sym.replace(".", "-")
+    return sym
+
+
+def _finalize_universe(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["Symbol"] = out["Symbol"].map(_normalize_symbol)
+    out["Company"] = out["Company"].astype(str).str.strip()
+    if "Sector" not in out.columns:
+        out["Sector"] = "N/A"
+    out["Sector"] = out["Sector"].astype(str).str.strip()
+    out = out[out["Symbol"].str.match(r"^[A-Z][A-Z0-9.-]{0,9}$", na=False)]
+    out = out.drop_duplicates(subset=["Symbol"], keep="first")
+    return out[["Symbol", "Company", "Sector"]].reset_index(drop=True)
+
+
+def _parse_ishares_holdings_csv(text: str) -> pd.DataFrame:
+    text = text.lstrip("\ufeff")
+    lines = text.splitlines()
+    start = next(
+        (
+            i
+            for i, line in enumerate(lines)
+            if re.search(r'^"?Ticker"?', line.strip(), re.I)
+        ),
+        None,
+    )
+    if start is None:
+        raise ValueError("Ticker 헤더 없음")
+
+    df_raw = pd.read_csv(io.StringIO("\n".join(lines[start:])))
+    df_raw.columns = [
+        re.sub(r'^"|"$', "", str(col)).strip() for col in df_raw.columns
+    ]
+    col_map = {c.lower(): c for c in df_raw.columns}
+
+    ticker_col = col_map.get("ticker") or col_map.get("symbol")
+    if not ticker_col:
+        raise ValueError("Ticker/Symbol 컬럼 없음")
+
+    name_col = col_map.get("name") or col_map.get("security") or ticker_col
+    sector_col = col_map.get("sector")
+    asset_col = col_map.get("asset class")
+
+    df_raw = df_raw.rename(
+        columns={ticker_col: "Symbol", name_col: "Company"}
+    )
+    df_raw["Sector"] = df_raw[sector_col] if sector_col else "N/A"
+
+    if asset_col:
+        asset = df_raw[asset_col].fillna("").astype(str).str.strip().str.lower()
+        keep = asset.isin({"equity", "common stock", "stocks"}) | asset.eq("")
+        df_raw = df_raw[keep].copy()
+
+    df_raw["Symbol"] = df_raw["Symbol"].astype(str).str.strip()
+    df_raw = df_raw[~df_raw["Symbol"].str.upper().isin({"TICKER", "NAN", ""])]
+    return _finalize_universe(df_raw)
+
+
+def _load_ishares_russell1000() -> pd.DataFrame:
+    session = requests.Session()
+    session.headers.update(_browser_headers())
+
+    page_resp = session.get(ISHARES_IWB_PRODUCT, timeout=30)
+    page_resp.raise_for_status()
+    page_html = page_resp.text.replace("&amp;", "&")
+
+    csv_urls: list[str] = []
+    for match in re.finditer(
+        r"(https://www\.ishares\.com[^\"'\s>]+\.ajax\?[^\"'\s>]*fileType=csv[^\"'\s>]*)",
+        page_html,
+        re.I,
+    ):
+        csv_urls.append(match.group(1))
+    for ts in re.findall(
+        r"(\d{10,})\.ajax\?fileType=csv[^\"'\s>]*fileName=IWB_holdings",
+        page_html,
+        re.I,
+    ):
+        csv_urls.append(
+            f"{ISHARES_IWB_PRODUCT}/{ts}.ajax"
+            "?fileType=csv&fileName=IWB_holdings&dataType=fund"
+        )
+
+    csv_urls.extend([
+        f"{ISHARES_IWB_PRODUCT}/1467271812596.ajax"
+        "?fileType=csv&fileName=IWB_holdings&dataType=fund",
+        "https://www.ishares.com/us/products/239707/"
+        "ISHARES-RUSSELL-1000-ETF/1467271812596.ajax"
+        "?fileType=csv&fileName=IWB_holdings&dataType=fund",
+    ])
+
+    seen: set[str] = set()
+    csv_headers = _browser_headers(referer=ISHARES_IWB_PRODUCT, accept_csv=True)
+    for url in csv_urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        resp = session.get(url, headers=csv_headers, timeout=30)
+        if resp.status_code != 200 or "Ticker" not in resp.text:
+            continue
+        df = _parse_ishares_holdings_csv(resp.text)
+        if len(df) > 100:
+            return df
+
+    tables = pd.read_html(io.StringIO(page_html))
+    rows = []
+    for table in tables:
+        cols = {str(c).strip().lower(): c for c in table.columns}
+        sym_key = next((k for k in cols if k in ("ticker", "symbol")), None)
+        if not sym_key:
+            continue
+        name_key = next((k for k in cols if k in ("name", "security", "company name")), sym_key)
+        sector_key = cols.get("sector")
+        for _, row in table.iterrows():
+            sym = _normalize_symbol(row[cols[sym_key]])
+            if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", sym):
+                continue
+            rows.append({
+                "Symbol": sym,
+                "Company": str(row[cols[name_key]]).strip(),
+                "Sector": str(row[sector_key]).strip() if sector_key else "N/A",
+            })
+    if rows:
+        df = _finalize_universe(pd.DataFrame(rows))
+        if len(df) > 100:
+            return df
+
+    raise ValueError("iShares IWB CSV/HTML에서 유효한 종목 목록을 찾지 못함")
+
+
+def _load_trendspider_russell1000() -> pd.DataFrame:
+    resp = requests.get(
+        TRENDSPIDER_R1000_URL,
+        headers=_browser_headers(),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    html = resp.text
+
+    rows: list[dict] = []
+    for table in pd.read_html(io.StringIO(html)):
+        sym_col = next(
+            (c for c in table.columns if str(c).strip().lower() in ("symbol", "ticker")),
+            None,
+        )
+        if sym_col is None:
+            continue
+        name_col = next(
+            (
+                c
+                for c in table.columns
+                if str(c).strip().lower() in ("company name", "name", "company")
+            ),
+            None,
+        )
+        for _, row in table.iterrows():
+            sym = _normalize_symbol(row[sym_col])
+            if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", sym):
+                continue
+            company = str(row[name_col]).strip() if name_col else sym
+            rows.append({"Symbol": sym, "Company": company, "Sector": "N/A"})
+
+    if len(rows) < 100:
+        for sym, company in re.findall(
+            r"\|\s*\[([A-Z][A-Z0-9.-]{0,9})\]\([^)]+\)\s*\|\s*\[([^\]]+)\]",
+            html,
+        ):
+            rows.append({
+                "Symbol": _normalize_symbol(sym),
+                "Company": company.strip(),
+                "Sector": "N/A",
+            })
+
+    df = _finalize_universe(pd.DataFrame(rows))
+    if len(df) < 100:
+        raise ValueError(f"종목 수 부족: {len(df)}")
+    return df
+
+
+def _load_sp500_plus_sp400() -> pd.DataFrame:
+    headers = _browser_headers()
+    sp500_resp = requests.get(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        headers=headers,
+        timeout=20,
+    )
+    sp500_resp.raise_for_status()
+    sp500 = pd.read_html(io.StringIO(sp500_resp.text))[0]
+    sp500 = sp500[["Symbol", "Security", "GICS Sector"]].rename(
+        columns={"Security": "Company", "GICS Sector": "Sector"}
+    )
+
+    sp400_resp = requests.get(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",
+        headers=headers,
+        timeout=20,
+    )
+    sp400_resp.raise_for_status()
+    sp400 = pd.read_html(io.StringIO(sp400_resp.text))[0]
+    symbol_col = next(
+        (c for c in sp400.columns if str(c).strip().lower() in ("symbol", "ticker symbol")),
+        None,
+    )
+    if symbol_col is None:
+        raise ValueError("S&P 400 Symbol 컬럼 없음")
+    company_col = next(
+        (c for c in sp400.columns if str(c).strip().lower() in ("security", "company")),
+        symbol_col,
+    )
+    sector_col = next(
+        (c for c in sp400.columns if "gics sector" in str(c).strip().lower()),
+        None,
+    )
+    sp400 = sp400[[symbol_col, company_col] + ([sector_col] if sector_col else [])].copy()
+    sp400 = sp400.rename(
+        columns={
+            symbol_col: "Symbol",
+            company_col: "Company",
+            **({sector_col: "Sector"} if sector_col else {}),
+        }
+    )
+    if "Sector" not in sp400.columns:
+        sp400["Sector"] = "N/A"
+
+    merged = pd.concat([sp500, sp400], ignore_index=True)
+    return _finalize_universe(merged)
+
+
+def _load_wikipedia_sp500() -> pd.DataFrame:
+    resp = requests.get(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        headers=_browser_headers(),
+        timeout=20,
+    )
+    resp.raise_for_status()
+    df = pd.read_html(io.StringIO(resp.text))[0]
+    df = df[["Symbol", "Security", "GICS Sector"]].rename(
+        columns={"Security": "Company", "GICS Sector": "Sector"}
+    )
+    return _finalize_universe(df)
+
+
+@st.cache_data(ttl=86400)
+def get_universe(source: str = "Russell 1000 (iShares IWB)"):
+    """
+    종목 유니버스 로딩
+    Russell 1000:
+      1) iShares IWB (CSV/HTML)
+      2) TrendSpider 공개 구성종목 표
+      3) Wikipedia S&P 500 + S&P 400 (대략 900종, R1000 근사)
+    S&P 500: Wikipedia
+    실패 시: 내장 100종목
+    """
+    if "Russell" in source:
+        loaders = [
+            ("iShares IWB", _load_ishares_russell1000),
+            ("TrendSpider", _load_trendspider_russell1000),
+            ("S&P 500 + S&P 400 (Russell 1000 근사)", _load_sp500_plus_sp400),
+        ]
+        errors: list[str] = []
+        for label, loader in loaders:
+            try:
+                df = loader()
+                if len(df) > 100:
+                    if label != "iShares IWB":
+                        st.info(f"Russell 1000: **{label}**에서 {len(df)}개 종목 로딩")
+                    return df
+                errors.append(f"{label}: 종목 수 {len(df)}")
+            except Exception as exc:
+                errors.append(f"{label}: {exc}")
+
+        st.error(
+            "Russell 1000 목록을 불러오지 못했습니다. "
+            "잠시 후 다시 시도하거나, 사이드바에서 S&P 500을 선택해 보세요.\n\n"
+            + " · ".join(errors)
+        )
+        st.warning("최후 수단으로 S&P 500만 사용합니다.")
+        try:
+            return _load_wikipedia_sp500()
+        except Exception as exc:
+            st.warning(f"Wikipedia S&P 500 실패 ({exc}), 내장 종목 사용.")
+
+    if "S&P" in source:
+        try:
+            return _load_wikipedia_sp500()
+        except Exception as exc:
+            st.warning(f"Wikipedia S&P 500 실패, 내장 종목 사용. ({exc})")
+
+    # ── 내장 100종목 ───────────────────────────────────────────
+    fallback = [
+        ("AAPL","Apple Inc.","Information Technology"),("MSFT","Microsoft Corp.","Information Technology"),
+        ("NVDA","NVIDIA Corp.","Information Technology"),("AMZN","Amazon.com Inc.","Consumer Discretionary"),
+        ("GOOGL","Alphabet Inc. Cl A","Communication Services"),("META","Meta Platforms Inc.","Communication Services"),
+        ("BRK-B","Berkshire Hathaway Cl B","Financials"),("TSLA","Tesla Inc.","Consumer Discretionary"),
+        ("LLY","Eli Lilly & Co.","Health Care"),("JPM","JPMorgan Chase & Co.","Financials"),
+        ("V","Visa Inc.","Financials"),("UNH","UnitedHealth Group Inc.","Health Care"),
+        ("XOM","Exxon Mobil Corp.","Energy"),("MA","Mastercard Inc.","Financials"),
+        ("AVGO","Broadcom Inc.","Information Technology"),("HD","Home Depot Inc.","Consumer Discretionary"),
+        ("PG","Procter & Gamble Co.","Consumer Staples"),("JNJ","Johnson & Johnson","Health Care"),
+        ("MRK","Merck & Co. Inc.","Health Care"),("ABBV","AbbVie Inc.","Health Care"),
+        ("CRM","Salesforce Inc.","Information Technology"),("COST","Costco Wholesale Corp.","Consumer Staples"),
+        ("AMD","Advanced Micro Devices","Information Technology"),("NFLX","Netflix Inc.","Communication Services"),
+        ("TMO","Thermo Fisher Scientific","Health Care"),("PEP","PepsiCo Inc.","Consumer Staples"),
+        ("KO","Coca-Cola Co.","Consumer Staples"),("WMT","Walmart Inc.","Consumer Staples"),
+        ("ORCL","Oracle Corp.","Information Technology"),("TXN","Texas Instruments Inc.","Information Technology"),
+        ("BAC","Bank of America Corp.","Financials"),("QCOM","Qualcomm Inc.","Information Technology"),
+        ("AMAT","Applied Materials Inc.","Information Technology"),("HON","Honeywell International","Industrials"),
+        ("CAT","Caterpillar Inc.","Industrials"),("GE","GE Aerospace","Industrials"),
+        ("AMGN","Amgen Inc.","Health Care"),("LOW","Lowe's Companies Inc.","Consumer Discretionary"),
+        ("GS","Goldman Sachs Group","Financials"),("MS","Morgan Stanley","Financials"),
+        ("CVX","Chevron Corp.","Energy"),("COP","ConocoPhillips","Energy"),
+        ("DE","Deere & Company","Industrials"),("LMT","Lockheed Martin Corp.","Industrials"),
+        ("NEE","NextEra Energy Inc.","Utilities"),("ADBE","Adobe Inc.","Information Technology"),
+        ("NOW","ServiceNow Inc.","Information Technology"),("INTU","Intuit Inc.","Information Technology"),
+        ("KLAC","KLA Corp.","Information Technology"),("LRCX","Lam Research Corp.","Information Technology"),
+        ("MU","Micron Technology Inc.","Information Technology"),("MRVL","Marvell Technology Inc.","Information Technology"),
+        ("ARM","Arm Holdings PLC","Information Technology"),("PANW","Palo Alto Networks","Information Technology"),
+        ("CRWD","CrowdStrike Holdings","Information Technology"),("UBER","Uber Technologies Inc.","Industrials"),
+        ("BKNG","Booking Holdings Inc.","Consumer Discretionary"),("ISRG","Intuitive Surgical Inc.","Health Care"),
+        ("VRT","Vertiv Holdings","Industrials"),("GEV","GE Vernova","Industrials"),
+    ]
+    return pd.DataFrame(fallback, columns=["Symbol", "Company", "Sector"])
+
+
+def get_eps_beat_info(ticker_obj, n_quarters: int):
+    """
+    최근 n_quarters 분기 모두 EPS 비트했는지 확인
+    Returns: (passed: bool, details: list of dicts)
+    """
+    try:
+        earnings = ticker_obj.get_earnings_dates(limit=20)
+        if earnings is None or earnings.empty:
+            return False, []
+
+        # 실제 발표된 분기만 필터 (Reported EPS 존재)
+        past = earnings.dropna(subset=['Reported EPS', 'EPS Estimate']).copy()
+        if len(past) < n_quarters:
+            return False, []
+
+        recent = past.head(n_quarters)
+        details = []
+        for idx, row in recent.iterrows():
+            est  = row['EPS Estimate']
+            rep  = row['Reported EPS']
+            beat = rep > est
+            surp = ((rep - est) / abs(est) * 100) if est != 0 else 0.0
+            details.append({
+                'date':     str(idx.date()) if hasattr(idx, 'date') else str(idx),
+                'estimate': round(float(est), 4),
+                'reported': round(float(rep), 4),
+                'surprise': round(float(surp), 2),
+                'beat':     bool(beat),
+            })
+
+        all_beat = all(d['beat'] for d in details)
+        return all_beat, details
+
+    except Exception:
+        return False, []
+
+
+def get_ma200_info(ticker_obj):
+    """
+    200일 이동평균선 대비 현재가 확인
+    Returns: (passed: bool, price, ma200, ratio) or None on failure
+    """
+    try:
+        hist = ticker_obj.history(period="300d", interval="1d")
+        if hist is None or len(hist) < 201:
+            return None
+
+        closes = hist['Close']
+        ma200  = closes.rolling(200).mean().iloc[-1]
+        price  = closes.iloc[-1]
+        ratio  = price / ma200
+
+        return {
+            'price':  round(float(price),  2),
+            'ma200':  round(float(ma200),  2),
+            'ratio':  round(float(ratio),  4),
+        }
+    except Exception:
+        return None
+
+
 def get_fper_info(ticker_obj, price: float):
     """
     Forward P/E Ratio 계산
@@ -106,12 +527,28 @@ def get_fper_info(ticker_obj, price: float):
 
 def screen_ticker(row, n_quarters, min_mcap_b, min_price_vs_ma,
                   use_fpe_filter=False, max_fwd_pe=40):
-"""단일 종목 스크리닝, 통과하면 결과 dict 반환, 아니면 None"""
-ticker_sym = row['Symbol']
-try:
-@@ -272,15 +321,27 @@
-if ma_info['ratio'] < min_price_vs_ma:
-return None
+    """단일 종목 스크리닝, 통과하면 결과 dict 반환, 아니면 None"""
+    ticker_sym = row['Symbol']
+    try:
+        t = yf.Ticker(ticker_sym)
+
+        # 시가총액 체크
+        info   = t.fast_info
+        mcap   = getattr(info, 'market_cap', None)
+        if mcap is None or mcap < min_mcap_b * 1e9:
+            return None
+
+        # EPS 비트 체크
+        eps_pass, eps_details = get_eps_beat_info(t, n_quarters)
+        if not eps_pass:
+            return None
+
+        # 200일선 체크
+        ma_info = get_ma200_info(t)
+        if ma_info is None:
+            return None
+        if ma_info['ratio'] < min_price_vs_ma:
+            return None
 
         # Forward P/E 계산
         fper = get_fper_info(t, ma_info['price'])
@@ -121,15 +558,7 @@ return None
             if fper['fwd_pe'] > max_fwd_pe:
                 return None
 
-return {
-            'Symbol':     ticker_sym,
-            'Company':    row['Company'],
-            'Sector':     row['Sector'],
-            'Price':      ma_info['price'],
-            'MA200':      ma_info['ma200'],
-            'Price/MA200':ma_info['ratio'],
-            'MCap($B)':   round(mcap / 1e9, 1),
-            'EPS Details':eps_details,
+        return {
             'Symbol':      ticker_sym,
             'Company':     row['Company'],
             'Sector':      row['Sector'],
@@ -142,62 +571,167 @@ return {
             'Fwd EPS':     fper.get('fwd_eps'),
             'Trail EPS':   fper.get('trail_eps'),
             'EPS Details': eps_details,
-}
+        }
 
-except Exception:
-@@ -336,7 +397,8 @@
-passed_metric.metric("조건 통과", len(results))
-skipped_metric.metric("데이터 없음/제외", skipped)
+    except Exception:
+        return None
 
-        result = screen_ticker(row, n_quarters, min_mcap_b, min_price_vs_ma)
+
+# ──────────────────────────────────────────
+# 메인 UI
+# ──────────────────────────────────────────
+st.markdown('<div class="main-title">📈 EPS Beat + 200일선 스크리너</div>', unsafe_allow_html=True)
+st.markdown(
+    f'<div class="sub-title">S&P 500 라지캡 | 최근 {n_quarters}분기 연속 EPS 비트 | 현재가 > 200일 이동평균선</div>',
+    unsafe_allow_html=True,
+)
+
+# 결과 캐시 초기화 버튼
+col_run, col_reset, _ = st.columns([2, 1, 5])
+with col_run:
+    run_btn = st.button("🚀 스크리닝 시작", type="primary", use_container_width=True)
+with col_reset:
+    if st.button("🗑️ 초기화", use_container_width=True):
+        st.session_state.pop('results', None)
+        st.session_state.pop('run_date', None)
+        get_universe.clear()
+        st.rerun()
+
+# ──────────────────────────────────────────
+# 스크리닝 실행
+# ──────────────────────────────────────────
+if run_btn:
+    if "Russell" in universe_src:
+        src_key = "Russell 1000 (iShares IWB)"
+    elif "S&P" in universe_src:
+        src_key = "S&P 500 (Wikipedia)"
+    else:
+        src_key = "Russell 1000 (iShares IWB)"   # 테스트도 Russell 1000에서 50개
+
+    sp500 = get_universe(src_key)
+    if "테스트" in universe_src:
+        sp500 = sp500.head(50)
+
+    total   = len(sp500)
+    results = []
+    errors  = []
+    skipped = 0
+
+    progress_bar = st.progress(0, text="초기화 중...")
+    status_col1, status_col2, status_col3 = st.columns(3)
+    scanned_metric  = status_col1.empty()
+    passed_metric   = status_col2.empty()
+    skipped_metric  = status_col3.empty()
+
+    log_placeholder = st.empty()
+    log_lines = []
+
+    for i, (_, row) in enumerate(sp500.iterrows()):
+        sym = row['Symbol']
+        pct = (i + 1) / total
+        progress_bar.progress(pct, text=f"스캔 중... {sym} ({i+1}/{total})")
+        scanned_metric.metric("스캔 완료", f"{i+1}/{total}")
+        passed_metric.metric("조건 통과", len(results))
+        skipped_metric.metric("데이터 없음/제외", skipped)
+
         result = screen_ticker(row, n_quarters, min_mcap_b, min_price_vs_ma,
                                use_fpe_filter, max_fwd_pe)
-time.sleep(request_delay)
+        time.sleep(request_delay)
 
-if result:
-@@ -374,26 +436,37 @@
-filtered = [r for r in results if r['Sector'] in sel_sectors]
+        if result:
+            results.append(result)
+            log_lines.insert(0, f"✅ {sym} — 통과")
+        else:
+            skipped += 1
+            log_lines.insert(0, f"⬜ {sym}")
 
-# 정렬
-        sort_by = st.selectbox("정렬 기준", ['Price/MA200 (내림차순)', 'MCap($B) (내림차순)', 'Symbol (가나다)'])
+        if len(log_lines) > 8:
+            log_lines = log_lines[:8]
+        log_placeholder.markdown("\n".join(log_lines))
+
+    progress_bar.progress(1.0, text="스크리닝 완료!")
+    st.session_state['results']  = results
+    st.session_state['run_date'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+# ──────────────────────────────────────────
+# 결과 표시
+# ──────────────────────────────────────────
+if 'results' in st.session_state:
+    results  = st.session_state['results']
+    run_date = st.session_state.get('run_date', '')
+
+    st.markdown(f"---")
+    st.markdown(f"### 🎯 조건 통과 종목 — {len(results)}개  <small style='color:#999'>({run_date} 기준)</small>",
+                unsafe_allow_html=True)
+
+    if not results:
+        st.warning("조건을 만족하는 종목이 없습니다. 조건을 완화해보세요.")
+    else:
+        # 섹터 필터
+        all_sectors = sorted(set(r['Sector'] for r in results))
+        sel_sectors = st.multiselect("섹터 필터", all_sectors, default=all_sectors)
+        filtered = [r for r in results if r['Sector'] in sel_sectors]
+
+        # 정렬
         sort_by = st.selectbox("정렬 기준", [
             'Price/MA200 (내림차순)', 'MCap($B) (내림차순)',
             'Fwd PE (오름차순)', 'Symbol (가나다)'
         ])
 
-if sort_by.startswith('Price/MA200'):
-filtered = sorted(filtered, key=lambda x: x['Price/MA200'], reverse=True)
-elif sort_by.startswith('MCap'):
-filtered = sorted(filtered, key=lambda x: x['MCap($B)'], reverse=True)
+        if sort_by.startswith('Price/MA200'):
+            filtered = sorted(filtered, key=lambda x: x['Price/MA200'], reverse=True)
+        elif sort_by.startswith('MCap'):
+            filtered = sorted(filtered, key=lambda x: x['MCap($B)'], reverse=True)
         elif sort_by.startswith('Fwd PE'):
             filtered = sorted(filtered, key=lambda x: (x['Fwd PE'] is None, x['Fwd PE'] or 9999))
-else:
-filtered = sorted(filtered, key=lambda x: x['Symbol'])
+        else:
+            filtered = sorted(filtered, key=lambda x: x['Symbol'])
 
-# 요약 테이블
-summary_rows = []
-for r in filtered:
-eps = r['EPS Details']
+        # 요약 테이블
+        summary_rows = []
+        for r in filtered:
+            eps = r['EPS Details']
             fpe_str   = f"{r['Fwd PE']:.1f}x"   if r.get('Fwd PE')   else "N/A"
             tpe_str   = f"{r['Trail PE']:.1f}x"  if r.get('Trail PE') else "N/A"
             feps_str  = f"${r['Fwd EPS']:.2f}"   if r.get('Fwd EPS')  else "N/A"
-row_d = {
-'Symbol':      r['Symbol'],
-'Company':     r['Company'],
-'Sector':      r['Sector'],
-'Price':       f"${r['Price']:,.2f}",
-'MA200':       f"${r['MA200']:,.2f}",
-'Price/MA200': f"{r['Price/MA200']:.2%}",
+            row_d = {
+                'Symbol':      r['Symbol'],
+                'Company':     r['Company'],
+                'Sector':      r['Sector'],
+                'Price':       f"${r['Price']:,.2f}",
+                'MA200':       f"${r['MA200']:,.2f}",
+                'Price/MA200': f"{r['Price/MA200']:.2%}",
                 'Fwd PE':      fpe_str,
                 'Trail PE':    tpe_str,
                 'Fwd EPS':     feps_str,
-'MCap($B)':    f"${r['MCap($B)']:,.1f}B",
-}
-for qi, q in enumerate(eps, 1):
-@@ -422,6 +495,15 @@
-sub2.metric("200일선",  f"${r['MA200']:,.2f}")
-sub1.metric("Price/MA", f"{r['Price/MA200']:.2%}")
-sub2.metric("시총",     f"${r['MCap($B)']:,.1f}B")
+                'MCap($B)':    f"${r['MCap($B)']:,.1f}B",
+            }
+            for qi, q in enumerate(eps, 1):
+                row_d[f"Q-{qi} 서프라이즈"] = f"+{q['surprise']:.1f}%" if q['surprise'] >= 0 else f"{q['surprise']:.1f}%"
+            summary_rows.append(row_d)
+
+        df_display = pd.DataFrame(summary_rows)
+        st.dataframe(df_display, use_container_width=True, hide_index=True)
+
+        # 상세 카드
+        st.markdown("#### 📋 종목별 상세")
+        cols_per_row = 3
+        for i in range(0, len(filtered), cols_per_row):
+            cols = st.columns(cols_per_row)
+            for j, col in enumerate(cols):
+                idx = i + j
+                if idx >= len(filtered):
+                    break
+                r = filtered[idx]
+                with col:
+                    with st.container(border=True):
+                        st.markdown(f"**{r['Symbol']}** &nbsp; <small>{r['Company']}</small>", unsafe_allow_html=True)
+                        st.caption(r['Sector'])
+                        sub1, sub2 = st.columns(2)
+                        sub1.metric("현재가",   f"${r['Price']:,.2f}")
+                        sub2.metric("200일선",  f"${r['MA200']:,.2f}")
+                        sub1.metric("Price/MA", f"{r['Price/MA200']:.2%}")
+                        sub2.metric("시총",     f"${r['MCap($B)']:,.1f}B")
                         sub3, sub4 = st.columns(2)
                         sub3.metric("Fwd P/E",
                                     f"{r['Fwd PE']:.1f}x" if r.get('Fwd PE') else "N/A",
@@ -207,6 +741,79 @@ sub2.metric("시총",     f"${r['MCap($B)']:,.1f}B")
                                     help="Trailing P/E = 현재가 / TTM EPS")
                         if r.get('Fwd EPS'):
                             st.caption(f"Fwd EPS: ${r['Fwd EPS']:.2f}  |  Trail EPS: ${r['Trail EPS']:.2f}" if r.get('Trail EPS') else f"Fwd EPS: ${r['Fwd EPS']:.2f}")
-st.markdown("**EPS 서프라이즈 (최신 → 과거)**")
-for qi, q in enumerate(r['EPS Details'], 1):
-chip_cls = "beat-chip" if q['beat'] else "miss-chip"
+                        st.markdown("**EPS 서프라이즈 (최신 → 과거)**")
+                        for qi, q in enumerate(r['EPS Details'], 1):
+                            chip_cls = "beat-chip" if q['beat'] else "miss-chip"
+                            sign     = "+" if q['surprise'] >= 0 else ""
+                            st.markdown(
+                                f"Q-{qi} `{q['date']}` &nbsp; Est: `{q['estimate']}` → Rep: `{q['reported']}` &nbsp;"
+                                f"<span class='{chip_cls}'>{sign}{q['surprise']:.1f}%</span>",
+                                unsafe_allow_html=True,
+                            )
+
+        # ── 다운로드 버튼 ────────────────────────────────────────
+        def build_markdown(results_list, run_dt, n_q, mcap_b, ratio):
+            lines = []
+            lines.append(f"# 📈 EPS Beat + 200일선 스크리닝 결과")
+            lines.append(f"")
+            lines.append(f"> **기준일**: {run_dt}  ")
+            lines.append(f"> **조건**: 최근 {n_q}분기 연속 EPS 비트 | 현재가/MA200 ≥ {ratio:.0%} | 시총 ≥ ${mcap_b}B  ")
+            lines.append(f"> **통과 종목**: {len(results_list)}개")
+            lines.append(f"")
+            lines.append(f"---")
+            lines.append(f"")
+
+            for r in results_list:
+                fpe  = f"{r['Fwd PE']:.1f}x"  if r.get('Fwd PE')   else "N/A"
+                tpe  = f"{r['Trail PE']:.1f}x" if r.get('Trail PE') else "N/A"
+                feps = f"${r['Fwd EPS']:.2f}"  if r.get('Fwd EPS')  else "N/A"
+
+                lines.append(f"## {r['Symbol']} — {r['Company']}")
+                lines.append(f"**섹터**: {r['Sector']}  ")
+                lines.append(f"")
+                lines.append(f"| 항목 | 값 |")
+                lines.append(f"|------|-----|")
+                lines.append(f"| 현재가 | ${r['Price']:,.2f} |")
+                lines.append(f"| 200일선 | ${r['MA200']:,.2f} |")
+                lines.append(f"| Price / MA200 | {r['Price/MA200']:.2%} |")
+                lines.append(f"| Forward P/E | {fpe} |")
+                lines.append(f"| Trailing P/E | {tpe} |")
+                lines.append(f"| Forward EPS | {feps} |")
+                lines.append(f"| 시가총액 | ${r['MCap($B)']:,.1f}B |")
+                lines.append(f"")
+                lines.append(f"**EPS 서프라이즈 (최신 → 과거)**")
+                lines.append(f"")
+                lines.append(f"| 분기 | 발표일 | 컨센서스 EPS | 실제 EPS | 서프라이즈 |")
+                lines.append(f"|------|--------|-------------|---------|-----------|")
+                for qi, q in enumerate(r['EPS Details'], 1):
+                    sign = "+" if q['surprise'] >= 0 else ""
+                    beat_icon = "✅" if q['beat'] else "❌"
+                    lines.append(
+                        f"| Q-{qi} | {q['date']} | {q['estimate']} "
+                        f"| {q['reported']} | {beat_icon} {sign}{q['surprise']:.1f}% |"
+                    )
+                lines.append(f"")
+                lines.append(f"---")
+                lines.append(f"")
+
+            lines.append(f"*Generated by EPS Beat Screener*")
+            return "\n".join(lines)
+
+        csv = df_display.to_csv(index=False, encoding='utf-8-sig')
+        md  = build_markdown(filtered, run_date, n_quarters, min_mcap_b, min_price_vs_ma)
+
+        dl1, dl2 = st.columns(2)
+        dl1.download_button(
+            "📥 CSV 다운로드",
+            data=csv,
+            file_name=f"eps_screener_{date.today()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        dl2.download_button(
+            "📝 Markdown 다운로드",
+            data=md.encode("utf-8"),
+            file_name=f"eps_screener_{date.today()}.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
