@@ -4,3 +4,4 @@ pandas>=2.0.0
 requests>=2.31.0
 lxml>=5.0.0
 html5lib>=1.1
+curl_cffi>=0.6.0
