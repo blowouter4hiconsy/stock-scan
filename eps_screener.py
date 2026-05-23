@@ -3,6 +3,7 @@ EPS Beat + 200일선 라지캡 스크리너
 - Russell 1000 / S&P 500 유니버스
 - 최근 N분기 연속 EPS 비트
 - 200일선 위(강세) 또는 아래(저평가) 선택 가능
+- ★ 야후 파이낸스 애널리스트 별점 추가 (recommendationMean / Key / # Analysts)
 """
 from __future__ import annotations
 
@@ -44,6 +45,17 @@ st.markdown("""
                   border-radius: 12px; padding: 2px 10px; font-size: 0.78rem; font-weight: 600; }
     .below-chip { display: inline-block; background: #fff3e0; color: #e65100;
                   border-radius: 12px; padding: 2px 10px; font-size: 0.78rem; font-weight: 600; }
+    /* ── 애널리스트 별점 뱃지 ── */
+    .r-strong-buy  { display:inline-block; background:#1e7e34; color:#fff;
+                     border-radius:8px; padding:1px 9px; font-size:.78rem; font-weight:600; }
+    .r-buy         { display:inline-block; background:#28a745; color:#fff;
+                     border-radius:8px; padding:1px 9px; font-size:.78rem; font-weight:600; }
+    .r-hold        { display:inline-block; background:#fd7e14; color:#fff;
+                     border-radius:8px; padding:1px 9px; font-size:.78rem; font-weight:600; }
+    .r-underperform{ display:inline-block; background:#dc3545; color:#fff;
+                     border-radius:8px; padding:1px 9px; font-size:.78rem; font-weight:600; }
+    .r-sell        { display:inline-block; background:#721c24; color:#fff;
+                     border-radius:8px; padding:1px 9px; font-size:.78rem; font-weight:600; }
     .stProgress > div > div { background: #1a73e8; }
     div[data-testid="stSidebar"] { background: #f7f9fc; }
 </style>
@@ -93,6 +105,27 @@ with st.sidebar:
         help="Forward P/E가 이 값보다 낮은 종목만 통과 (데이터 없는 종목은 통과 처리)",
     )
 
+    # ── 애널리스트 별점 필터 (신규) ─────────────────────────────
+    st.markdown("---")
+    st.markdown("### ⭐ 애널리스트 별점 필터")
+    use_rating_filter = st.checkbox("별점 하한 적용", value=False,
+                                    help="야후 파이낸스 recommendationMean 기준 (1=Strong Buy, 5=Strong Sell)")
+    # 표시 편의를 위해 슬라이더를 '별 개수'로 표현 (5개=1.xx, 1개=4.xx)
+    MIN_STARS_LABEL = {5: "⭐⭐⭐⭐⭐ Strong Buy (≤1.5)", 4: "⭐⭐⭐⭐ Buy (≤2.5)",
+                       3: "⭐⭐⭐ Hold (≤3.5)", 2: "⭐⭐ Underperform (≤4.5)"}
+    min_star_sel = st.select_slider(
+        "최소 평균 평점",
+        options=[5, 4, 3, 2],
+        value=4,
+        format_func=lambda v: MIN_STARS_LABEL[v],
+        disabled=not use_rating_filter,
+        help="선택한 등급 이상(숫자 기준 이하)인 종목만 통과",
+    )
+    # 별 개수 → recommendationMean 상한 변환
+    STAR_TO_MEAN_MAX = {5: 1.5, 4: 2.5, 3: 3.5, 2: 4.5}
+    max_rating_mean = STAR_TO_MEAN_MAX[min_star_sel]
+    # ────────────────────────────────────────────────────────────
+
     # 저평가 모드 전용 추가 필터
     if not above_mode:
         st.markdown("---")
@@ -121,7 +154,7 @@ with st.sidebar:
     st.caption("Russell 1000 전체 스캔 시 20~30분 소요됩니다.")
 
 # ──────────────────────────────────────────
-# 유니버스 로딩 (기존 동일)
+# 유니버스 로딩
 # ──────────────────────────────────────────
 ISHARES_IWB_PRODUCT = "https://www.ishares.com/us/products/239707/ishares-russell-1000-etf"
 
@@ -371,14 +404,14 @@ def _ma200_from_closes(closes):
     if closes is None or len(closes) < 201: return None
     ma200 = closes.rolling(200).mean().iloc[-1]
     price = closes.iloc[-1]
-    high52 = closes.rolling(252).max().iloc[-1]   # 52주 고점
+    high52 = closes.rolling(252).max().iloc[-1]
     if pd.isna(ma200) or ma200 <= 0 or pd.isna(price): return None
     return {
-        "price":      round(float(price), 2),
-        "ma200":      round(float(ma200), 2),
-        "ratio":      round(float(price / ma200), 4),
-        "high52":     round(float(high52), 2) if not pd.isna(high52) else None,
-        "drawdown":   round((price - high52) / high52 * 100, 1) if not pd.isna(high52) and high52 > 0 else None,
+        "price":    round(float(price), 2),
+        "ma200":    round(float(ma200), 2),
+        "ratio":    round(float(price / ma200), 4),
+        "high52":   round(float(high52), 2) if not pd.isna(high52) else None,
+        "drawdown": round((price - high52) / high52 * 100, 1) if not pd.isna(high52) and high52 > 0 else None,
     }
 
 def build_ma200_cache(symbols, chunk_size, use_batch):
@@ -491,6 +524,61 @@ def get_ma200_info(ticker_obj, ma_cache=None, symbol=""):
         return _ma200_from_closes(hist["Close"])
     except Exception: return None
 
+# ══════════════════════════════════════════
+# ★ 신규: 애널리스트 별점 조회 함수
+# ══════════════════════════════════════════
+# Yahoo Finance info 필드:
+#   recommendationMean  : float 1(Strong Buy) ~ 5(Strong Sell)
+#   recommendationKey   : "strong_buy" | "buy" | "hold" | "underperform" | "sell"
+#   numberOfAnalystOpinions : int
+_KEY_LABEL = {
+    "strong_buy":   "Strong Buy",
+    "buy":          "Buy",
+    "hold":         "Hold",
+    "underperform": "Underperform",
+    "sell":         "Sell",
+}
+_KEY_CSS = {
+    "Strong Buy":   "r-strong-buy",
+    "Buy":          "r-buy",
+    "Hold":         "r-hold",
+    "Underperform": "r-underperform",
+    "Sell":         "r-sell",
+}
+
+def get_analyst_rating(ticker_obj):
+    """
+    야후 파이낸스 애널리스트 컨센서스 반환.
+    반환값:
+        rating_mean  : float 1~5  (1=Strong Buy, 5=Strong Sell) | None
+        rating_key   : str  e.g. "Buy", "Hold"                  | "N/A"
+        rating_stars : int  1~5  (별 개수, mean 반올림 역산)      | None
+        n_analysts   : int  분석가 수                             | None
+    """
+    try:
+        info    = _quiet_call(lambda: ticker_obj.info)
+        mean    = info.get("recommendationMean")
+        key_raw = info.get("recommendationKey", "")
+        n_anal  = info.get("numberOfAnalystOpinions")
+
+        key_label = _KEY_LABEL.get(str(key_raw).lower(), key_raw or "N/A")
+
+        # 별 개수: mean 1→5개별, 5→1개별  (반올림 후 클램프)
+        if mean is not None:
+            stars = max(1, min(5, round(6 - float(mean))))
+        else:
+            stars = None
+
+        return {
+            "rating_mean":  round(float(mean), 2) if mean is not None else None,
+            "rating_key":   key_label,
+            "rating_stars": stars,
+            "n_analysts":   int(n_anal) if n_anal is not None else None,
+        }
+    except Exception:
+        return {"rating_mean": None, "rating_key": "N/A", "rating_stars": None, "n_analysts": None}
+
+
 def get_fper_info(ticker_obj, price):
     try:
         info     = _quiet_call(lambda: ticker_obj.info)
@@ -519,6 +607,7 @@ def screen_ticker(
     above_mode, ma_ratio_threshold,
     use_fpe_filter=False, max_fwd_pe=40,
     use_max_drawdown=False, min_drawdown_pct=20,
+    use_rating_filter=False, max_rating_mean=2.5,
     ma_cache=None,
 ):
     ticker_sym = row["Symbol"]
@@ -529,16 +618,14 @@ def screen_ticker(
         if ma_info is None: return None
 
         ratio = ma_info["ratio"]
-        # 200일선 위/아래 필터
         if above_mode:
-            if ratio < ma_ratio_threshold: return None   # 위 모드: 비율 하한
+            if ratio < ma_ratio_threshold: return None
         else:
-            if ratio > ma_ratio_threshold: return None   # 아래 모드: 비율 상한
-            # 52주 고점 대비 하락률 필터
+            if ratio > ma_ratio_threshold: return None
             if use_max_drawdown:
                 drawdown = ma_info.get("drawdown")
                 if drawdown is None or drawdown > -min_drawdown_pct:
-                    return None   # drawdown은 음수이므로 -pct보다 커야 통과
+                    return None
 
         mcap = _get_market_cap(t)
         if mcap is None or mcap < min_mcap_b * 1e9: return None
@@ -546,25 +633,39 @@ def screen_ticker(
         eps_pass, eps_details = get_eps_beat_info(t, ticker_sym, n_quarters)
         if not eps_pass: return None
 
-        fper = get_fper_info(t, ma_info["price"]) if use_fpe_filter else {"fwd_pe":None,"trail_pe":None,"fwd_eps":None,"trail_eps":None}
+        fper = get_fper_info(t, ma_info["price"]) if use_fpe_filter else \
+               {"fwd_pe":None,"trail_pe":None,"fwd_eps":None,"trail_eps":None}
         if use_fpe_filter and fper.get("fwd_pe") is not None:
             if fper["fwd_pe"] > max_fwd_pe: return None
 
+        # ── 애널리스트 별점 수집 & 필터 ──────────────────────────
+        analyst = get_analyst_rating(t)
+        if use_rating_filter and analyst["rating_mean"] is not None:
+            if analyst["rating_mean"] > max_rating_mean:
+                return None
+        # ─────────────────────────────────────────────────────────
+
         return {
-            "Symbol":      ticker_sym,
-            "Company":     row["Company"],
-            "Sector":      row["Sector"],
-            "Price":       ma_info["price"],
-            "MA200":       ma_info["ma200"],
-            "Price/MA200": ratio,
-            "High52":      ma_info.get("high52"),
-            "Drawdown%":   ma_info.get("drawdown"),
-            "MCap($B)":    round(mcap/1e9, 1),
-            "Fwd PE":      fper.get("fwd_pe"),
-            "Trail PE":    fper.get("trail_pe"),
-            "Fwd EPS":     fper.get("fwd_eps"),
-            "Trail EPS":   fper.get("trail_eps"),
-            "EPS Details": eps_details,
+            "Symbol":        ticker_sym,
+            "Company":       row["Company"],
+            "Sector":        row["Sector"],
+            "Price":         ma_info["price"],
+            "MA200":         ma_info["ma200"],
+            "Price/MA200":   ratio,
+            "High52":        ma_info.get("high52"),
+            "Drawdown%":     ma_info.get("drawdown"),
+            "MCap($B)":      round(mcap/1e9, 1),
+            "Fwd PE":        fper.get("fwd_pe"),
+            "Trail PE":      fper.get("trail_pe"),
+            "Fwd EPS":       fper.get("fwd_eps"),
+            "Trail EPS":     fper.get("trail_eps"),
+            # ── 별점 ──────────────────────────────────────────────
+            "Rating Mean":   analyst["rating_mean"],
+            "Rating Key":    analyst["rating_key"],
+            "Rating Stars":  analyst["rating_stars"],
+            "# Analysts":    analyst["n_analysts"],
+            # ──────────────────────────────────────────────────────
+            "EPS Details":   eps_details,
         }
     except Exception: return None
 
@@ -643,6 +744,7 @@ if run_btn:
             above_mode, ma_ratio_threshold,
             use_fpe_filter, max_fwd_pe,
             use_max_drawdown, min_drawdown_pct,
+            use_rating_filter, max_rating_mean,
             ma_cache=ma_cache,
         )
         time.sleep(request_delay)
@@ -687,14 +789,16 @@ if "results" in st.session_state:
         filtered = [r for r in results if r["Sector"] in sel_sectors]
 
         sort_options = (
-            ["Drawdown% (하락 큰 순)", "Price/MA200 (오름차순)", "Fwd PE (오름차순)", "MCap($B) (내림차순)", "Symbol (가나다)"]
+            ["Drawdown% (하락 큰 순)", "Rating (좋은 순)", "Price/MA200 (오름차순)", "Fwd PE (오름차순)", "MCap($B) (내림차순)", "Symbol (가나다)"]
             if is_below else
-            ["Price/MA200 (내림차순)", "MCap($B) (내림차순)", "Fwd PE (오름차순)", "Symbol (가나다)"]
+            ["Price/MA200 (내림차순)", "Rating (좋은 순)", "MCap($B) (내림차순)", "Fwd PE (오름차순)", "Symbol (가나다)"]
         )
         sort_by = st.selectbox("정렬 기준", sort_options)
 
         if "Drawdown" in sort_by:
             filtered = sorted(filtered, key=lambda x: (x["Drawdown%"] is None, x["Drawdown%"] or 0))
+        elif "Rating" in sort_by:
+            filtered = sorted(filtered, key=lambda x: (x["Rating Mean"] is None, x["Rating Mean"] or 9))
         elif "Price/MA200 (내림)" in sort_by:
             filtered = sorted(filtered, key=lambda x: x["Price/MA200"], reverse=True)
         elif "Price/MA200 (오름)" in sort_by:
@@ -706,9 +810,16 @@ if "results" in st.session_state:
         else:
             filtered = sorted(filtered, key=lambda x: x["Symbol"])
 
-        # 요약 테이블
+        # ── 요약 테이블 ──────────────────────────────────────────
         summary_rows = []
         for r in filtered:
+            # 별점 텍스트 표현
+            if r.get("Rating Stars") is not None:
+                stars_str = "⭐" * r["Rating Stars"]
+                rating_str = f"{stars_str}  {r['Rating Mean']:.2f}"
+            else:
+                rating_str = "N/A"
+
             row_d = {
                 "Symbol":      r["Symbol"],
                 "Company":     r["Company"],
@@ -720,6 +831,11 @@ if "results" in st.session_state:
             if is_below:
                 row_d["52W High"] = f"${r['High52']:,.2f}" if r.get("High52") else "N/A"
                 row_d["Drawdown"] = f"{r['Drawdown%']:.1f}%" if r.get("Drawdown%") is not None else "N/A"
+            # ── 별점 컬럼 ───────────────────────────────────────
+            row_d["Rating"]      = rating_str
+            row_d["Rating Key"]  = r.get("Rating Key") or "N/A"
+            row_d["# Analysts"]  = r.get("# Analysts") if r.get("# Analysts") is not None else "N/A"
+            # ────────────────────────────────────────────────────
             row_d["Fwd PE"]   = f"{r['Fwd PE']:.1f}x"   if r.get("Fwd PE")   else "N/A"
             row_d["Trail PE"] = f"{r['Trail PE']:.1f}x"  if r.get("Trail PE") else "N/A"
             row_d["Fwd EPS"]  = f"${r['Fwd EPS']:.2f}"  if r.get("Fwd EPS")  else "N/A"
@@ -731,7 +847,7 @@ if "results" in st.session_state:
 
         st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-        # 종목 카드
+        # ── 종목 카드 ────────────────────────────────────────────
         st.markdown("#### 📋 종목별 상세")
         for i in range(0, len(filtered), 3):
             cols = st.columns(3)
@@ -745,10 +861,10 @@ if "results" in st.session_state:
                         st.markdown(f"**{r['Symbol']}** &nbsp; {chip}", unsafe_allow_html=True)
                         st.caption(f"{r['Company']} · {r['Sector']}")
                         c1, c2 = st.columns(2)
-                        c1.metric("현재가",   f"${r['Price']:,.2f}")
-                        c2.metric("200일선",  f"${r['MA200']:,.2f}")
+                        c1.metric("현재가",  f"${r['Price']:,.2f}")
+                        c2.metric("200일선", f"${r['MA200']:,.2f}")
                         c1.metric("Price/MA", f"{r['Price/MA200']:.2%}")
-                        c2.metric("시총",     f"${r['MCap($B)']:,.1f}B")
+                        c2.metric("시총",    f"${r['MCap($B)']:,.1f}B")
                         if is_below and r.get("High52"):
                             c3, c4 = st.columns(2)
                             c3.metric("52W 고점", f"${r['High52']:,.2f}")
@@ -757,6 +873,25 @@ if "results" in st.session_state:
                         c5, c6 = st.columns(2)
                         c5.metric("Fwd P/E",   f"{r['Fwd PE']:.1f}x"  if r.get("Fwd PE")  else "N/A")
                         c6.metric("Trail P/E", f"{r['Trail PE']:.1f}x" if r.get("Trail PE") else "N/A")
+
+                        # ── ★ 애널리스트 별점 섹션 ─────────────────
+                        st.markdown("**📊 애널리스트 별점**")
+                        if r.get("Rating Mean") is not None:
+                            rkey    = r.get("Rating Key", "N/A")
+                            stars   = r.get("Rating Stars", 0)
+                            css_cls = _KEY_CSS.get(rkey, "r-hold")
+                            n_a     = r.get("# Analysts")
+                            n_str   = f"&nbsp;<small>({n_a}명 분석가)</small>" if n_a else ""
+                            st.markdown(
+                                f"<span style='font-size:1.1rem'>{'⭐' * stars}</span>"
+                                f"&nbsp;<b>{r['Rating Mean']:.2f}</b> / 5.00&nbsp;"
+                                f"<span class='{css_cls}'>{rkey}</span>{n_str}",
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.caption("애널리스트 데이터 없음")
+                        # ─────────────────────────────────────────────
+
                         st.markdown("**EPS 서프라이즈**")
                         for qi, q in enumerate(r["EPS Details"], 1):
                             chip_cls = "beat-chip" if q["beat"] else "miss-chip"
@@ -780,6 +915,14 @@ if "results" in st.session_state:
                 fpe  = f"{r['Fwd PE']:.1f}x"  if r.get("Fwd PE")  else "N/A"
                 tpe  = f"{r['Trail PE']:.1f}x" if r.get("Trail PE") else "N/A"
                 feps = f"${r['Fwd EPS']:.2f}"  if r.get("Fwd EPS") else "N/A"
+                # 별점 마크다운
+                if r.get("Rating Mean") is not None:
+                    stars_md = "⭐" * (r.get("Rating Stars") or 0)
+                    rating_md = f"{stars_md} {r['Rating Mean']:.2f} ({r.get('Rating Key','N/A')})"
+                    if r.get("# Analysts"):
+                        rating_md += f", 분석가 {r['# Analysts']}명"
+                else:
+                    rating_md = "N/A"
                 lines += [
                     f"## {r['Symbol']} — {r['Company']}",
                     f"**섹터**: {r['Sector']}  ", "",
@@ -794,6 +937,7 @@ if "results" in st.session_state:
                         f"| 고점 대비 하락 | {r['Drawdown%']:.1f}% |" if r.get("Drawdown%") is not None else "| 고점 대비 하락 | N/A |",
                     ]
                 lines += [
+                    f"| 애널리스트 별점 | {rating_md} |",   # ← 신규
                     f"| Forward P/E | {fpe} |",
                     f"| Trailing P/E | {tpe} |",
                     f"| Forward EPS | {feps} |",
